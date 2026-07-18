@@ -1,6 +1,6 @@
 import type { LangfuseRuntime, LangfuseScoreClient } from "./types.js";
 import { state } from "./state.js";
-import { randomUUID } from "node:crypto";
+import { randomUUID, createHash } from "node:crypto";
 
 let runtime: LangfuseRuntime | null = null;
 let registeredContextManager: OtelContextManager | null = null;
@@ -295,6 +295,55 @@ function eventTimestamp(record: { endTime?: string; startTime?: string; timestam
   return record.endTime ?? record.startTime ?? record.timestamp ?? nowIso();
 }
 
+// ponytail: crude size guard against the ingestion server's hard 4.5mb body limit.
+// Images are already uploaded to Langfuse media storage and replaced with short reference
+// tags upstream (see media-upload.ts), so by the time a trace reaches this fallback path
+// its input/output no longer contain inline base64. This just catches any other unexpectedly
+// huge string field (e.g. giant tool output) so one oversized session can't fail the whole flush.
+const REST_FALLBACK_MAX_BODY_BYTES = 3.5 * 1024 * 1024; // stay under server's 4.5mb limit
+function redactedPlaceholder(raw: string): string {
+  const hash = createHash("sha256").update(raw).digest("hex").slice(0, 16);
+  return `[oversized:${hash}]`;
+}
+
+function redactMedia(value: unknown, seen = new WeakSet<object>()): unknown {
+  if (typeof value === "string") {
+    return value.length > 8192 ? redactedPlaceholder(value) : value;
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => redactMedia(item, seen));
+  }
+  if (value && typeof value === "object") {
+    if (seen.has(value)) return value;
+    seen.add(value);
+    const obj = value as Record<string, unknown>;
+    const out: Record<string, unknown> = {};
+    for (const key of Object.keys(obj)) {
+      out[key] = redactMedia(obj[key], seen);
+    }
+    return out;
+  }
+  return value;
+}
+
+function chunkBatchBySize(items: any[], maxBytes: number): any[][] {
+  const chunks: any[][] = [];
+  let current: any[] = [];
+  let currentSize = 0;
+  for (const item of items) {
+    const itemSize = Buffer.byteLength(JSON.stringify(item), "utf8");
+    if (current.length > 0 && currentSize + itemSize > maxBytes) {
+      chunks.push(current);
+      current = [];
+      currentSize = 0;
+    }
+    current.push(item);
+    currentSize += itemSize;
+  }
+  if (current.length > 0) chunks.push(current);
+  return chunks;
+}
+
 async function fallbackToRestIngestion(rt: LangfuseRuntime) {
   const store = rt.restFallback as RestFallbackStore | undefined;
   if (!store?.trace || store.attempted) {
@@ -316,8 +365,8 @@ async function fallbackToRestIngestion(rt: LangfuseRuntime) {
         id: trace.id,
         timestamp: trace.timestamp,
         name: trace.name,
-        input: trace.input,
-        output: trace.output,
+        input: redactMedia(trace.input),
+        output: redactMedia(trace.output),
         sessionId: trace.sessionId,
         metadata: trace.metadata,
       },
@@ -331,8 +380,8 @@ async function fallbackToRestIngestion(rt: LangfuseRuntime) {
       name: observation.name,
       startTime: observation.startTime,
       endTime: observation.endTime,
-      input: observation.input,
-      output: observation.output,
+      input: redactMedia(observation.input),
+      output: redactMedia(observation.output),
       metadata: observation.metadata,
       level: observation.level,
       statusMessage: observation.statusMessage,
@@ -361,17 +410,21 @@ async function fallbackToRestIngestion(rt: LangfuseRuntime) {
     return;
   }
 
-  const response = await withTimeout(
-    "REST fallback ingestion",
-    ingestionApi.batch({
-      batch,
-      metadata: {
-        source: "pi-langfuse",
-        fallback: "rest-ingestion",
-        reason: "otel-trace-not-visible-after-flush",
-      },
-    }),
-  );
+  const chunks = chunkBatchBySize(batch, REST_FALLBACK_MAX_BODY_BYTES);
+  let response: unknown;
+  for (const chunk of chunks) {
+    response = await withTimeout(
+      "REST fallback ingestion",
+      ingestionApi.batch({
+        batch: chunk,
+        metadata: {
+          source: "pi-langfuse",
+          fallback: "rest-ingestion",
+          reason: "otel-trace-not-visible-after-flush",
+        },
+      }),
+    );
+  }
 
   if (!response) {
     return;

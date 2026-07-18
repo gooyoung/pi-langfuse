@@ -2,6 +2,7 @@ import { state, resetRunState, computeEvaluationScores } from "../state.js";
 import { getRuntime, sendScore } from "../langfuse.js";
 import { ensureConfig } from "../config.js";
 import { shapePayload, truncate, extractFinalAssistant, extractAssistantOutput, getCapturePolicy } from "../utils.js";
+import { uploadImagesInPlace } from "../media-upload.js";
 import { closeDanglingObservations } from "./tool.js";
 import { applyCapturePolicy } from "../capture-policy.js";
 import { collectSourceMetadata } from "../source-metadata.js";
@@ -63,9 +64,11 @@ export async function startAgentRun(event: Record<string, unknown>, ctx: any) {
       // Ignore if getSystemPrompt is not available or fails
     }
 
+    // Images are uploaded to Langfuse media storage separately below (after the trace/root
+    // observation exists, since the upload needs a traceId) rather than inlined here — inlining
+    // full base64 would get mangled by shapePayload/redactValue's 12k-char string truncation.
     const rawPromptInput = shapePayload({
       prompt: event.prompt,
-      images: event.images,
       context: event.context ?? event.attachments,
     });
     const sourceMetadata = collectSourceMetadata(cwd);
@@ -117,7 +120,20 @@ export async function startAgentRun(event: Record<string, unknown>, ctx: any) {
 
     state.agentState.root = root;
     state.agentState.traceId = root.traceId;
-    updateTraceIO(captured.input, undefined);
+
+    let finalInput = captured.input;
+    const images = event.images;
+    if (captured.input && Array.isArray(images) && images.length > 0) {
+      try {
+        const uploadedImages = await uploadImagesInPlace(rt, images, root.traceId, "input");
+        finalInput = { ...(captured.input as Record<string, unknown>), images: uploadedImages };
+        root.update({ input: finalInput });
+        state.agentState.promptInput = finalInput;
+      } catch (e) {
+        console.warn("📊 Langfuse: Failed to attach images to trace", e);
+      }
+    }
+    updateTraceIO(finalInput, undefined);
   } catch (e) {
     console.warn("📊 Langfuse: Failed to create agent observation", e);
     state.isTracingDisabled = true;
