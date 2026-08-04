@@ -442,6 +442,91 @@ test("shutdown aborts an active score request and retries within its deadline", 
   }
 });
 
+test("shutdown sends queued scores before a stalled OTel flush", async () => {
+  const calls: string[] = [];
+  const originalFetch = globalThis.fetch;
+  const previousConfig = state.config;
+  const runtime = createTestRuntime({
+    pendingScores: [],
+    scoreFlushAt: 10,
+    scoreFlushIntervalMs: 60_000,
+    scoreRequestTimeoutMs: 1_000,
+    runtimeConfig: {
+      publicKey: "pk_test",
+      secretKey: "sk_test",
+      host: "https://example.com",
+    },
+    tracerProvider: {
+      forceFlush: async () => {
+        calls.push("otel");
+        await never();
+      },
+    },
+  });
+  globalThis.fetch = (async () => {
+    calls.push("score");
+    return new Response(JSON.stringify({ errors: [] }), { status: 200 });
+  }) as typeof fetch;
+
+  try {
+    state.config = { ...runtime.runtimeConfig! };
+    __setRuntimeForTest(runtime, 50);
+
+    await sendScore("turn_count", 1, { traceId: "trace-1" });
+    await forceShutdownRuntime();
+
+    assert.deepEqual(calls, ["score", "otel"]);
+    assert.deepEqual(runtime.pendingScores, []);
+  } finally {
+    await disposeTestRuntime(runtime);
+    state.config = previousConfig;
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("shutdown score delivery uses PI_LANGFUSE_SCORE_SHUTDOWN_TIMEOUT", async () => {
+  const originalFetch = globalThis.fetch;
+  const previousConfig = state.config;
+  const previousTimeout = process.env.PI_LANGFUSE_SCORE_SHUTDOWN_TIMEOUT;
+  const runtime = createTestRuntime({
+    pendingScores: [{ name: "turn_count", value: 1, traceId: "trace-1" }],
+    runtimeConfig: {
+      publicKey: "pk_test",
+      secretKey: "sk_test",
+      host: "https://example.com",
+    },
+  });
+  let aborted = false;
+  globalThis.fetch = ((_input, init) => new Promise<Response>((_resolve, reject) => {
+    init?.signal?.addEventListener("abort", () => {
+      aborted = true;
+      reject(new DOMException("Aborted", "AbortError"));
+    }, { once: true });
+  })) as typeof fetch;
+  process.env.PI_LANGFUSE_SCORE_SHUTDOWN_TIMEOUT = "0.01";
+
+  try {
+    state.config = { ...runtime.runtimeConfig! };
+    __setRuntimeForTest(runtime, 1_000);
+    const startedAt = Date.now();
+
+    await forceShutdownRuntime();
+
+    assert.equal(aborted, true);
+    assert.equal(runtime.pendingScores?.length, 1);
+    assert.ok(Date.now() - startedAt < 250, "score shutdown timeout should not use the 1s runtime deadline");
+  } finally {
+    await disposeTestRuntime(runtime);
+    state.config = previousConfig;
+    globalThis.fetch = originalFetch;
+    if (previousTimeout === undefined) {
+      delete process.env.PI_LANGFUSE_SCORE_SHUTDOWN_TIMEOUT;
+    } else {
+      process.env.PI_LANGFUSE_SCORE_SHUTDOWN_TIMEOUT = previousTimeout;
+    }
+  }
+});
+
 test("scores are buffered instead of starting an unbounded SDK request", async () => {
   let scoreCreateCalls = 0;
   const runtime = {

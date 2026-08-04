@@ -77,6 +77,14 @@ export LANGFUSE_BASE_URL="https://cloud.langfuse.com"  # 可选；也支持 LANG
 
 保存的配置优先级更高。只有当 `~/.pi/agent/pi-langfuse/config.json` 缺失或不完整时，扩展才会使用环境变量。
 
+对于短生命周期的 SDK 宿主，可设置关闭时最终分数发送尝试的上限：
+
+```bash
+export PI_LANGFUSE_SCORE_SHUTDOWN_TIMEOUT=2  # 单位为秒；默认 2 秒
+```
+
+扩展会在其他关闭遥测工作之前尝试发送已排队的 trace 级分数。该值不会延长总关闭超时。
+
 隐私采集策略也可以通过环境变量设置：
 
 ```bash

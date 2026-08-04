@@ -77,6 +77,14 @@ export LANGFUSE_BASE_URL="https://cloud.langfuse.com"  # optional; LANGFUSE_HOST
 
 Saved config takes precedence. Environment variables are only used when `~/.pi/agent/pi-langfuse/config.json` is missing or incomplete.
 
+For short-lived SDK hosts, set the bounded final score-delivery attempt during shutdown:
+
+```bash
+export PI_LANGFUSE_SCORE_SHUTDOWN_TIMEOUT=2  # seconds; defaults to 2 seconds
+```
+
+The extension attempts queued trace-level scores before other shutdown telemetry work. This value cannot extend the overall shutdown deadline.
+
 Privacy controls can also be set through environment variables:
 
 ```bash

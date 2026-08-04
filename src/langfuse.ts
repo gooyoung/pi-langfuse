@@ -60,6 +60,7 @@ interface RestFallbackStore {
 const OTEL_VISIBILITY_TIMEOUT_MS = 1_500;
 const OTEL_VISIBILITY_POLL_INTERVAL_MS = 200;
 const DEFAULT_SHUTDOWN_STEP_TIMEOUT_MS = 2_000;
+const DEFAULT_SCORE_SHUTDOWN_TIMEOUT_MS = 2_000;
 const DEFAULT_LANGFUSE_REQUEST_TIMEOUT_SECONDS = 5;
 const DEFAULT_SCORE_FLUSH_AT = 10;
 const DEFAULT_SCORE_FLUSH_INTERVAL_MS = 1_000;
@@ -78,6 +79,13 @@ function resolvePositiveEnvNumber(name: string, fallback: number, integer = fals
     return fallback;
   }
   return integer ? Math.floor(parsed) : parsed;
+}
+
+function getScoreShutdownTimeoutMs(): number {
+  return resolvePositiveEnvNumber(
+    "PI_LANGFUSE_SCORE_SHUTDOWN_TIMEOUT",
+    DEFAULT_SCORE_SHUTDOWN_TIMEOUT_MS / 1_000,
+  ) * 1_000;
 }
 
 function delay(ms: number, signal?: AbortSignal) {
@@ -642,6 +650,12 @@ function doShutdownRuntime(): Promise<void> {
     const deadline = Date.now() + shutdownStepTimeoutMs;
     const controller = new AbortController();
     const abortTimeout = setTimeout(() => controller.abort(), shutdownStepTimeoutMs);
+    const scoreController = new AbortController();
+    const scoreAbortTimeout = setTimeout(
+      () => scoreController.abort(),
+      Math.min(getScoreShutdownTimeoutMs(), shutdownStepTimeoutMs),
+    );
+    scoreAbortTimeout.unref?.();
     stopScoreFlush(rt);
 
     try {
@@ -650,13 +664,13 @@ function doShutdownRuntime(): Promise<void> {
         () => rt.scoreFlushPromise,
         deadline,
       );
+      await flushPendingScores(rt, scoreController.signal);
       await withShutdownDeadline("OTel force flush", () => rt.tracerProvider?.forceFlush?.(), deadline);
       await withShutdownDeadline(
         "REST fallback ingestion",
         () => fallbackToRestIngestion(rt, controller.signal),
         deadline,
       );
-      await flushPendingScores(rt, controller.signal);
       await withShutdownDeadline("Langfuse score flush", () => rt.scoreClient.flush?.(), deadline);
       await withShutdownDeadline("Langfuse client shutdown", () => rt.scoreClient.shutdown?.(), deadline);
       await withShutdownDeadline("OTel tracer shutdown", () => rt.tracerProvider?.shutdown?.(), deadline);
@@ -665,6 +679,8 @@ function doShutdownRuntime(): Promise<void> {
       console.warn("📊 Langfuse: Failed to flush/shutdown cleanly", e);
     } finally {
       clearTimeout(abortTimeout);
+      clearTimeout(scoreAbortTimeout);
+      scoreController.abort();
       clearScoreFlushTimer(rt);
       rt.scoreFlushController?.abort();
       rt.scoreFlushController = undefined;
