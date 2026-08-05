@@ -30,7 +30,7 @@ Recommended checks while working on the extension:
 
 ```bash
 npm run typecheck
-node --test test/*.test.ts
+npm test
 ```
 
 Basic manual validation:
@@ -217,7 +217,7 @@ Recommended checks after substantive changes:
 
 ```bash
 npm run typecheck
-node --test test/*.test.ts
+npm test
 ```
 
 For integration-sensitive changes, also run Pi with the extension enabled and verify:
