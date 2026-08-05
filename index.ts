@@ -8,7 +8,7 @@
  */
 
 import { basename } from "node:path";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 import { state, resetRunState, runWithSession, setCurrentSession } from "./src/state.js";
 import { ensureConfig, promptForConfig, loadConfig } from "./src/config.js";
@@ -74,10 +74,18 @@ export default async function (pi: ExtensionAPI) {
     },
   });
 
-  const getSessionId = (ctx?: any) => {
+  const getSessionId = (ctx?: unknown): string | undefined => {
     try {
-      const sessionFile = ctx?.sessionManager?.getSessionFile?.();
-      return sessionFile ? basename(sessionFile, ".jsonl") : undefined;
+      const sessionManager = (ctx as ExtensionContext | undefined)?.sessionManager;
+      const sessionId = sessionManager?.getSessionId?.();
+      if (typeof sessionId === "string" && sessionId) {
+        return sessionId;
+      }
+
+      const sessionFile = sessionManager?.getSessionFile?.();
+      return typeof sessionFile === "string" && sessionFile
+        ? basename(sessionFile, ".jsonl")
+        : undefined;
     } catch {
       return undefined;
     }
