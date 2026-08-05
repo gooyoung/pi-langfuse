@@ -60,6 +60,7 @@ export interface LangfuseScoreClient {
 }
 
 export interface PendingScore {
+  id?: string;
   traceId?: string;
   sessionId?: string;
   observationId?: string;
