@@ -16,7 +16,7 @@ import { shutdownRuntime } from "./src/langfuse.js";
 import { handleLangfusePrivacyCommand, handleLangfuseStatusCommand, handleLangfuseTestCommand } from "./src/commands.js";
 import { getMessageFromEvent, extractAssistantOutput, getCapturePolicy } from "./src/utils.js";
 import { applyCapturePolicy } from "./src/capture-policy.js";
-import { startAgentRun, finishAgentRun } from "./src/handlers/agent.js";
+import { startAgentRun, finishAgentRun, recordSystemPrompt } from "./src/handlers/agent.js";
 import { startTurnObservation, finishTurnObservation } from "./src/handlers/turn.js";
 import {
   startGeneration,
@@ -104,6 +104,9 @@ export default async function (pi: ExtensionAPI) {
     if (!state.agentState?.root) {
       await startAgentRun(event, ctx);
     }
+    // The system prompt is only final here: before_agent_start handlers that
+    // run after this extension may still rewrite it.
+    await recordSystemPrompt(ctx);
   }));
 
   pi.on("turn_start", async (event, ctx) => withSession(ctx, async () => {
