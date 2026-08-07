@@ -139,7 +139,19 @@ export function getLastRuntimeError(): { scope: string; message: string; timesta
   return lastRuntimeError;
 }
 
-async function withShutdownDeadline<T>(label: string, startOperation: () => Promise<T> | undefined, deadline: number): Promise<T | undefined> {
+function isExpectedShutdownAbort(error: unknown, signal: AbortSignal): boolean {
+  return signal.aborted
+    && error === signal.reason
+    && error instanceof Error
+    && error.name === "AbortError";
+}
+
+async function withShutdownDeadline<T>(
+  label: string,
+  startOperation: () => Promise<T> | undefined,
+  deadline: number,
+  expectedAbortSignal?: AbortSignal,
+): Promise<T | undefined> {
   const remainingMs = deadline - Date.now();
   if (remainingMs <= 0) {
     debugLog(`📊 Langfuse: Skipped ${label}; shutdown deadline elapsed`);
@@ -162,6 +174,12 @@ async function withShutdownDeadline<T>(label: string, startOperation: () => Prom
         }, remainingMs);
       }),
     ]);
+  } catch (error) {
+    if (expectedAbortSignal && isExpectedShutdownAbort(error, expectedAbortSignal)) {
+      debugLog(`📊 Langfuse: ${label} aborted; shutdown deadline elapsed`);
+      return undefined;
+    }
+    throw error;
   } finally {
     if (timeout) {
       clearTimeout(timeout);
@@ -670,6 +688,7 @@ function doShutdownRuntime(): Promise<void> {
         "REST fallback ingestion",
         () => fallbackToRestIngestion(rt, controller.signal),
         deadline,
+        controller.signal,
       );
       await withShutdownDeadline("Langfuse score flush", () => rt.scoreClient.flush?.(), deadline);
       await withShutdownDeadline("Langfuse client shutdown", () => rt.scoreClient.shutdown?.(), deadline);

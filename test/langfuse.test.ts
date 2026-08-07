@@ -7,6 +7,7 @@ import {
   __setRuntimeForTest,
   ensureOtelContextManager,
   forceShutdownRuntime,
+  getLastRuntimeError,
   getRuntime,
   sendScore,
 } from "../src/langfuse.ts";
@@ -726,6 +727,91 @@ test("REST fallback checks visibility and ingests the trace through abortable HT
   } finally {
     __setRuntimeForTest(null);
     globalThis.fetch = originalFetch;
+  }
+});
+
+test("shutdown treats its controller AbortError as an expected deadline", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalWarn = console.warn;
+  const previousError = getLastRuntimeError();
+  const warnings: unknown[][] = [];
+  const runtime = createTestRuntime({
+    runtimeConfig: {
+      publicKey: "pk-test",
+      secretKey: "sk-test",
+      host: "https://example.com",
+    },
+    restFallback: {
+      trace: {
+        id: "deadline-trace",
+        timestamp: new Date().toISOString(),
+        name: "pi-agent",
+      },
+      observations: [],
+      observationById: new Map(),
+      attempted: false,
+    },
+  });
+  globalThis.fetch = ((_input, init) => new Promise<Response>((_resolve, reject) => {
+    const signal = init?.signal;
+    signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+  })) as typeof fetch;
+  console.warn = (...args: unknown[]) => warnings.push(args);
+
+  try {
+    __setRuntimeForTest(runtime, 50);
+    await forceShutdownRuntime();
+
+    assert.equal(warnings.length, 0);
+    assert.equal(getLastRuntimeError(), previousError);
+  } finally {
+    __setRuntimeForTest(null);
+    globalThis.fetch = originalFetch;
+    console.warn = originalWarn;
+  }
+});
+
+test("shutdown still reports an unrelated AbortError", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalWarn = console.warn;
+  const warnings: unknown[][] = [];
+  const runtime = createTestRuntime({
+    runtimeConfig: {
+      publicKey: "pk-test",
+      secretKey: "sk-test",
+      host: "https://example.com",
+    },
+    restFallback: {
+      trace: {
+        id: "unrelated-abort-trace",
+        timestamp: new Date().toISOString(),
+        name: "pi-agent",
+      },
+      observations: [],
+      observationById: new Map(),
+      attempted: false,
+    },
+  });
+  let calls = 0;
+  globalThis.fetch = (async () => {
+    calls += 1;
+    if (calls === 1) {
+      return new Response(null, { status: 404 });
+    }
+    throw new DOMException("Unrelated request cancellation", "AbortError");
+  }) as typeof fetch;
+  console.warn = (...args: unknown[]) => warnings.push(args);
+
+  try {
+    __setRuntimeForTest(runtime, 2_000);
+    await forceShutdownRuntime();
+
+    assert.equal(warnings.length, 1);
+    assert.match(String(warnings[0]?.[0]), /Failed to flush\/shutdown cleanly/);
+  } finally {
+    __setRuntimeForTest(null);
+    globalThis.fetch = originalFetch;
+    console.warn = originalWarn;
   }
 });
 
