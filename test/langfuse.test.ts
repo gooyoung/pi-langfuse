@@ -394,9 +394,10 @@ test("failed score ingestion keeps the batch queued", async () => {
   }
 });
 
-test("shutdown aborts an active score request and retries within its deadline", async () => {
+test("shutdown aborts an active score request and retries with a stable score ID", async () => {
   let calls = 0;
   let firstRequestAborted = false;
+  const scoreIds: unknown[] = [];
   const originalFetch = globalThis.fetch;
   const previousConfig = state.config;
   const runtime = createTestRuntime({
@@ -412,6 +413,10 @@ test("shutdown aborts an active score request and retries within its deadline", 
   });
   globalThis.fetch = ((_input, init) => {
     calls += 1;
+    const request = JSON.parse(String(init?.body)) as {
+      batch: Array<{ body: { id?: unknown } }>;
+    };
+    scoreIds.push(request.batch[0]?.body.id);
     if (calls === 1) {
       return new Promise<Response>((_resolve, reject) => {
         init?.signal?.addEventListener("abort", () => {
@@ -434,6 +439,8 @@ test("shutdown aborts an active score request and retries within its deadline", 
 
     assert.equal(firstRequestAborted, true);
     assert.equal(calls, 2);
+    assert.equal(typeof scoreIds[0], "string");
+    assert.deepEqual(scoreIds, [scoreIds[0], scoreIds[0]]);
     assert.deepEqual(runtime.pendingScores, []);
   } finally {
     await disposeTestRuntime(runtime);

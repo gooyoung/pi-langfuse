@@ -219,6 +219,9 @@ async function flushPendingScores(rt: LangfuseRuntime, signal: AbortSignal): Pro
 
   while (pendingScores.length > 0) {
     const scores = pendingScores.slice(0, MAX_SCORE_BATCH_SIZE);
+    for (const score of scores) {
+      score.id ??= randomUUID();
+    }
     try {
       const errors = await ingestBatch(
         rt,
