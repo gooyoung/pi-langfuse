@@ -4,8 +4,11 @@ import { readFile } from "node:fs/promises";
 
 import registerExtension from "../index.ts";
 import { __setRuntimeForTest } from "../src/langfuse.ts";
-import { state } from "../src/state.ts";
+import { clearAllSessionStates, state } from "../src/state.ts";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { LangfuseRuntime } from "../src/types.ts";
+
+type ExtensionHandler = Parameters<ExtensionAPI["on"]>[1];
 
 test("agent_end waits for runtime shutdown", async () => {
   const handlers = new Map<string, (event: Record<string, unknown>, ctx: unknown) => Promise<void>>();
@@ -65,6 +68,72 @@ test("agent_end waits for runtime shutdown", async () => {
       releaseForceFlush();
     }
     __setRuntimeForTest(null);
+    state.config = previousConfig;
+  }
+});
+
+void test("uses logical Pi session IDs with the legacy file fallback", async () => {
+  const handlers = new Map<string, ExtensionHandler>();
+  const propagatedSessionIds: (string | undefined)[] = [];
+  const previousConfig = state.config;
+  const observation = {
+    id: "observation-id",
+    traceId: "trace-id",
+    update() {
+      return this;
+    },
+    end() {
+      return undefined;
+    },
+  };
+  const runtime: LangfuseRuntime = {
+    startObservation: () => observation,
+    propagateAttributes: (attributes, fn) => {
+      propagatedSessionIds.push(attributes.sessionId);
+      return fn();
+    },
+    scoreClient: {},
+  };
+
+  try {
+    state.config = {
+      publicKey: "pk_test",
+      secretKey: "sk_test",
+      host: "https://example.com",
+    };
+    __setRuntimeForTest(runtime);
+    await registerExtension({
+      registerCommand() {
+        return undefined;
+      },
+      on(name, handler) {
+        handlers.set(name, handler);
+      },
+    });
+
+    const beforeAgentStart = handlers.get("before_agent_start");
+    assert.ok(beforeAgentStart);
+
+    await beforeAgentStart({ prompt: "test" }, {
+      sessionManager: {
+        getSessionId: () => "00000000-0000-7000-8000-000000000003",
+        getSessionFile: () => undefined,
+      },
+    });
+
+    await beforeAgentStart({ prompt: "legacy test" }, {
+      sessionManager: {
+        getSessionFile: () => "/sessions/legacy-session.jsonl",
+      },
+    });
+
+    assert.deepEqual(propagatedSessionIds, [
+      "00000000-0000-7000-8000-000000000003",
+      "legacy-session",
+    ]);
+  } finally {
+    __setRuntimeForTest(null);
+    clearAllSessionStates();
     state.config = previousConfig;
   }
 });

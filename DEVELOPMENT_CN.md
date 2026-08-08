@@ -30,7 +30,7 @@ pi link /path/to/pi-langfuse
 
 ```bash
 npm run typecheck
-node --test test/*.test.ts
+npm test
 ```
 
 基础手动验证：
@@ -217,7 +217,7 @@ Trace (name: "pi-agent")
 
 ```bash
 npm run typecheck
-node --test test/*.test.ts
+npm test
 ```
 
 如果改动涉及集成行为，还需要启用扩展运行 Pi，并额外确认：
