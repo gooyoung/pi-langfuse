@@ -54,15 +54,6 @@ export async function startAgentRun(event: Record<string, unknown>, ctx: any) {
       state.currentProvider = ctx.model.provider || "";
     }
 
-    let systemPrompt = undefined;
-    try {
-      if (ctx.getSystemPrompt) {
-        systemPrompt = await ctx.getSystemPrompt();
-      }
-    } catch {
-      // Ignore if getSystemPrompt is not available or fails
-    }
-
     const rawPromptInput = shapePayload({
       prompt: event.prompt,
       images: event.images,
@@ -79,7 +70,6 @@ export async function startAgentRun(event: Record<string, unknown>, ctx: any) {
           ...(state.currentProvider ? { provider: state.currentProvider } : {}),
           sessionId: state.currentSessionId || undefined,
         },
-        systemPrompt: systemPrompt ? truncate(String(systemPrompt), getLimits().maxString) : undefined,
       },
       getCapturePolicy(),
     );
@@ -106,10 +96,7 @@ export async function startAgentRun(event: Record<string, unknown>, ctx: any) {
           "pi-agent",
             {
               input: captured.input,
-              metadata: {
-                ...(captured.metadata ?? {}),
-                ...(captured.systemPrompt ? { systemPrompt: captured.systemPrompt } : {}),
-              },
+              metadata: captured.metadata ?? {},
             },
           { asType: "agent" },
         ),
@@ -121,6 +108,49 @@ export async function startAgentRun(event: Record<string, unknown>, ctx: any) {
   } catch (e) {
     console.warn("📊 Langfuse: Failed to create agent observation", e);
     state.isTracingDisabled = true;
+  }
+}
+
+/**
+ * Records the effective system prompt on the root agent observation.
+ *
+ * Deliberately called from `agent_start` rather than `before_agent_start`:
+ * during `before_agent_start` the extension runner hands each handler the
+ * prompt as it stands mid-chain, so extensions registered after this one
+ * (e.g. inline factories that rewrite the system prompt) are not reflected
+ * yet. By `agent_start` the session has applied the final override, and
+ * `ctx.getSystemPrompt()` returns the prompt actually sent to the model.
+ */
+export async function recordSystemPrompt(ctx: any) {
+  const root = state.agentState?.root;
+  if (state.isTracingDisabled || !root) {
+    return;
+  }
+
+  let systemPrompt = undefined;
+  try {
+    if (ctx.getSystemPrompt) {
+      systemPrompt = await ctx.getSystemPrompt();
+    }
+  } catch {
+    // Ignore if getSystemPrompt is not available or fails
+  }
+  if (!systemPrompt) {
+    return;
+  }
+
+  const captured = applyCapturePolicy(
+    { systemPrompt: truncate(String(systemPrompt), getLimits().maxString) },
+    getCapturePolicy(),
+  );
+  if (!captured.systemPrompt) {
+    return;
+  }
+
+  try {
+    root.update({ metadata: { systemPrompt: captured.systemPrompt } });
+  } catch (e) {
+    console.warn("\u{1F4CA} Langfuse: Failed to record system prompt", e);
   }
 }
 
