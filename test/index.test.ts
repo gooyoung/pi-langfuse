@@ -54,9 +54,7 @@ test("agent_end waits for runtime shutdown", async () => {
       settled = true;
     });
 
-    for (let i = 0; i < 5 && !forceFlushStarted; i++) {
-      await Promise.resolve();
-    }
+    await new Promise<void>((resolve) => setImmediate(resolve));
     assert.equal(settled, false);
     assert.equal(forceFlushStarted, true);
 
