@@ -7,6 +7,7 @@ import {
   __setRuntimeForTest,
   ensureOtelContextManager,
   forceShutdownRuntime,
+  getLastRuntimeError,
   getRuntime,
   sendScore,
 } from "../src/langfuse.ts";
@@ -190,6 +191,137 @@ test("force shutdown applies one total deadline to stalled telemetry operations"
     __setRuntimeForTest(null);
     console.warn = originalWarn;
     console.log = originalLog;
+  }
+});
+
+test("shutdown treats a fallback deadline abort as expected control flow", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalWarn = console.warn;
+  const warnings: unknown[][] = [];
+  const previousRuntimeError = getLastRuntimeError();
+  const runtime = createTestRuntime({
+    runtimeConfig: {
+      publicKey: "pk-test",
+      secretKey: "sk-test",
+      host: "https://example.com",
+    },
+    restFallback: {
+      trace: {
+        id: "slow-trace",
+        timestamp: new Date().toISOString(),
+        name: "pi-agent",
+      },
+      observations: [],
+      observationById: new Map(),
+      attempted: false,
+    },
+  });
+
+  console.warn = (...args: unknown[]) => warnings.push(args);
+  globalThis.fetch = ((_input, init) => new Promise<Response>((_resolve, reject) => {
+    init?.signal?.addEventListener("abort", () => {
+      reject(new DOMException("Aborted", "AbortError"));
+    }, { once: true });
+  })) as typeof fetch;
+
+  try {
+    __setRuntimeForTest(runtime, 50);
+    await forceShutdownRuntime();
+
+    assert.equal(warnings.length, 0);
+    assert.equal(getLastRuntimeError(), previousRuntimeError);
+  } finally {
+    __setRuntimeForTest(null);
+    console.warn = originalWarn;
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("shutdown completes primary cleanup before best-effort REST fallback", async () => {
+  const calls: string[] = [];
+  const originalFetch = globalThis.fetch;
+  const runtime = createTestRuntime({
+    scoreClient: {
+      flush: async () => { calls.push("score-flush"); },
+      shutdown: async () => { calls.push("client-shutdown"); },
+    },
+    tracerProvider: {
+      forceFlush: async () => { calls.push("otel-flush"); },
+      shutdown: async () => { calls.push("tracer-shutdown"); },
+    },
+    runtimeConfig: {
+      publicKey: "pk-test",
+      secretKey: "sk-test",
+      host: "https://example.com",
+    },
+    restFallback: {
+      trace: {
+        id: "ordered-trace",
+        timestamp: new Date().toISOString(),
+        name: "pi-agent",
+      },
+      observations: [],
+      observationById: new Map(),
+      attempted: false,
+    },
+  });
+
+  globalThis.fetch = (async () => {
+    calls.push("fallback-fetch");
+    return new Response(null, { status: 404 });
+  }) as typeof fetch;
+
+  try {
+    __setRuntimeForTest(runtime, 200);
+    await forceShutdownRuntime();
+
+    assert.deepEqual(calls, [
+      "otel-flush",
+      "score-flush",
+      "client-shutdown",
+      "tracer-shutdown",
+      "fallback-fetch",
+      "fallback-fetch",
+    ]);
+  } finally {
+    __setRuntimeForTest(null);
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("shutdown continues after a primary cleanup step fails", async () => {
+  const calls: string[] = [];
+  const originalWarn = console.warn;
+  const warnings: unknown[][] = [];
+  const runtime = createTestRuntime({
+    scoreClient: {
+      flush: async () => {
+        calls.push("score-flush");
+        throw new Error("score flush failed");
+      },
+      shutdown: async () => { calls.push("client-shutdown"); },
+    },
+    tracerProvider: {
+      forceFlush: async () => { calls.push("otel-flush"); },
+      shutdown: async () => { calls.push("tracer-shutdown"); },
+    },
+  });
+  console.warn = (...args: unknown[]) => warnings.push(args);
+
+  try {
+    __setRuntimeForTest(runtime, 200);
+    await forceShutdownRuntime();
+
+    assert.deepEqual(calls, [
+      "otel-flush",
+      "score-flush",
+      "client-shutdown",
+      "tracer-shutdown",
+    ]);
+    assert.equal(warnings.length, 1);
+  } finally {
+    __setRuntimeForTest(null);
+    console.warn = originalWarn;
   }
 });
 
@@ -534,6 +666,47 @@ test("shutdown score delivery uses PI_LANGFUSE_SCORE_SHUTDOWN_TIMEOUT", async ()
   }
 });
 
+test("score shutdown timeout bounds a pending fetch that ignores abort", async () => {
+  const originalFetch = globalThis.fetch;
+  const previousConfig = state.config;
+  const previousTimeout = process.env.PI_LANGFUSE_SCORE_SHUTDOWN_TIMEOUT;
+  const runtime = createTestRuntime({
+    pendingScores: [{ name: "turn_count", value: 1, traceId: "trace-1" }],
+    runtimeConfig: {
+      publicKey: "pk_test",
+      secretKey: "sk_test",
+      host: "https://example.com",
+    },
+  });
+  globalThis.fetch = (() => new Promise<Response>(() => {})) as typeof fetch;
+  process.env.PI_LANGFUSE_SCORE_SHUTDOWN_TIMEOUT = "0.02";
+
+  try {
+    state.config = { ...runtime.runtimeConfig! };
+    __setRuntimeForTest(runtime, 1_000);
+
+    const result = await new Promise<"resolved" | "timed-out">((resolve) => {
+      const timeout = setTimeout(() => resolve("timed-out"), 250);
+      void forceShutdownRuntime().then(() => {
+        clearTimeout(timeout);
+        resolve("resolved");
+      });
+    });
+
+    assert.equal(result, "resolved");
+    assert.equal(runtime.pendingScores?.length, 1);
+  } finally {
+    await disposeTestRuntime(runtime);
+    state.config = previousConfig;
+    globalThis.fetch = originalFetch;
+    if (previousTimeout === undefined) {
+      delete process.env.PI_LANGFUSE_SCORE_SHUTDOWN_TIMEOUT;
+    } else {
+      process.env.PI_LANGFUSE_SCORE_SHUTDOWN_TIMEOUT = previousTimeout;
+    }
+  }
+});
+
 test("scores are buffered instead of starting an unbounded SDK request", async () => {
   let scoreCreateCalls = 0;
   const runtime = {
@@ -676,7 +849,127 @@ test("score flush logs per-event ingestion errors", async () => {
   }
 });
 
-test("REST fallback checks visibility and ingests the trace through abortable HTTP", async () => {
+test("REST fallback skips legacy ingestion when the legacy trace API is unavailable", async () => {
+  const requests: Array<{ method: string; url: string }> = [];
+  const runtime = createTestRuntime({
+    runtimeConfig: {
+      publicKey: "pk-test",
+      secretKey: "sk-test",
+      host: "https://example.com",
+    },
+    restFallback: {
+      trace: {
+        id: "v4-trace",
+        timestamp: new Date().toISOString(),
+        name: "pi-agent",
+      },
+      observations: [],
+      observationById: new Map(),
+      attempted: false,
+    },
+  });
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (input, init) => {
+    requests.push({ method: init?.method ?? "GET", url: String(input) });
+    return new Response(null, { status: 404 });
+  }) as typeof fetch;
+
+  try {
+    __setRuntimeForTest(runtime, 2_000);
+    await forceShutdownRuntime();
+
+    assert.deepEqual(requests, [
+      { method: "GET", url: "https://example.com/api/public/traces/v4-trace" },
+      { method: "GET", url: "https://example.com/api/public/traces?limit=1" },
+    ]);
+  } finally {
+    __setRuntimeForTest(null);
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("REST fallback fails closed when legacy API capability is ambiguous", async () => {
+  const requests: Array<{ method: string; url: string }> = [];
+  const runtime = createTestRuntime({
+    runtimeConfig: {
+      publicKey: "pk-test",
+      secretKey: "sk-test",
+      host: "https://example.com",
+    },
+    restFallback: {
+      trace: {
+        id: "ambiguous-trace",
+        timestamp: new Date().toISOString(),
+        name: "pi-agent",
+      },
+      observations: [],
+      observationById: new Map(),
+      attempted: false,
+    },
+  });
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (input, init) => {
+    const url = String(input);
+    requests.push({ method: init?.method ?? "GET", url });
+    return new Response(null, { status: url.endsWith("?limit=1") ? 500 : 404 });
+  }) as typeof fetch;
+
+  try {
+    __setRuntimeForTest(runtime, 2_000);
+    await forceShutdownRuntime();
+
+    assert.deepEqual(requests, [
+      { method: "GET", url: "https://example.com/api/public/traces/ambiguous-trace" },
+      { method: "GET", url: "https://example.com/api/public/traces?limit=1" },
+    ]);
+  } finally {
+    __setRuntimeForTest(null);
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("REST fallback stops after a trace is visible", async () => {
+  const requests: Array<{ method: string; url: string }> = [];
+  const runtime = createTestRuntime({
+    runtimeConfig: {
+      publicKey: "pk-test",
+      secretKey: "sk-test",
+      host: "https://example.com",
+    },
+    restFallback: {
+      trace: {
+        id: "visible-trace",
+        timestamp: new Date().toISOString(),
+        name: "pi-agent",
+      },
+      observations: [],
+      observationById: new Map(),
+      attempted: false,
+    },
+  });
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (input, init) => {
+    requests.push({ method: init?.method ?? "GET", url: String(input) });
+    return new Response(JSON.stringify({ id: "visible-trace" }), { status: 200 });
+  }) as typeof fetch;
+
+  try {
+    __setRuntimeForTest(runtime, 2_000);
+    await forceShutdownRuntime();
+
+    assert.deepEqual(requests, [
+      { method: "GET", url: "https://example.com/api/public/traces/visible-trace" },
+    ]);
+  } finally {
+    __setRuntimeForTest(null);
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("REST fallback checks legacy API capability and ingests a missing trace", async () => {
   const requests: Array<{ method: string; url: string; body?: string }> = [];
   const runtime = {
     startObservation: (() => {
@@ -706,12 +999,19 @@ test("REST fallback checks visibility and ingests the trace through abortable HT
   const originalFetch = globalThis.fetch;
   globalThis.fetch = (async (input, init) => {
     const method = init?.method ?? "GET";
+    const url = String(input);
     requests.push({
       method,
-      url: String(input),
+      url,
       body: typeof init?.body === "string" ? init.body : undefined,
     });
     if (method === "GET") {
+      if (url === "https://example.com/api/public/traces?limit=1") {
+        return new Response(JSON.stringify({ data: [] }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
       return new Response(null, { status: 404 });
     }
     return new Response(JSON.stringify({ successes: [], errors: [] }), {
@@ -727,6 +1027,9 @@ test("REST fallback checks visibility and ingests the trace through abortable HT
     assert.ok(requests.some((request) =>
       request.method === "GET"
       && request.url === "https://example.com/api/public/traces/fallback-trace"));
+    assert.equal(requests.filter((request) =>
+      request.method === "GET"
+      && request.url === "https://example.com/api/public/traces?limit=1").length, 1);
     const ingestion = requests.find((request) => request.method === "POST");
     assert.equal(ingestion?.url, "https://example.com/api/public/ingestion");
     assert.match(ingestion?.body ?? "", /"type":"trace-create"/);

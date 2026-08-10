@@ -14,7 +14,7 @@ Langfuse observability extension for [Pi Coding Agent](https://github.com/earend
 - Final assistant output capture, tool error visibility, and trace-level scores.
 - Privacy controls for inputs, outputs, tool I/O, system prompt, and cwd.
 - Secret redaction and local path hashing before upload.
-- REST fallback for self-hosted Langfuse setups where OTel spans arrive but traces do not materialize.
+- Capability-gated REST fallback for self-hosted Langfuse setups that expose the legacy trace API when OTel spans arrive but traces do not materialize. Langfuse v4 `events_only` deployments use OTel without legacy fallback ingestion.
 
 ## Prerequisites
 

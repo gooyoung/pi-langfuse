@@ -14,7 +14,7 @@
 - 记录最终助手输出、工具错误状态和追踪级别分数。
 - 提供输入、输出、工具 I/O、system prompt 和 cwd 的隐私采集开关。
 - 上传前脱敏常见密钥，并对本地绝对路径做 hash。
-- 针对自托管 Langfuse 提供 REST 兜底，覆盖 OTel span 已到达但 trace 未可见的场景。
+- 对仍提供旧版 trace API 的自托管 Langfuse 启用能力检测后的 REST 兜底，覆盖 OTel span 已到达但 trace 未可见的场景；Langfuse v4 `events_only` 部署仅使用 OTel，不执行旧版 REST 兜底写入。
 
 ## 前提条件
 

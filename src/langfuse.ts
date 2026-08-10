@@ -8,6 +8,8 @@ const activeSessions = new Set<string>();
 let lastRuntimeError: { scope: string; message: string; timestamp: Date } | null = null;
 
 type FallbackObservationType = "SPAN" | "GENERATION";
+type LegacyTraceApiCapability = "supported" | "unsupported";
+type TraceVisibility = "visible" | "missing" | "legacy-api-unsupported" | "unknown";
 
 interface OtelContextManager {
   enable(): OtelContextManager;
@@ -55,6 +57,7 @@ interface RestFallbackStore {
   observations: RestFallbackObservation[];
   observationById: Map<string, RestFallbackObservation>;
   attempted: boolean;
+  legacyTraceApi?: LegacyTraceApiCapability;
 }
 
 const OTEL_VISIBILITY_TIMEOUT_MS = 1_500;
@@ -139,7 +142,16 @@ export function getLastRuntimeError(): { scope: string; message: string; timesta
   return lastRuntimeError;
 }
 
-async function withShutdownDeadline<T>(label: string, startOperation: () => Promise<T> | undefined, deadline: number): Promise<T | undefined> {
+function isAbortError(error: unknown): boolean {
+  return error instanceof Error && error.name === "AbortError";
+}
+
+async function withShutdownDeadline<T>(
+  label: string,
+  startOperation: () => Promise<T> | undefined,
+  deadline: number,
+  signal?: AbortSignal,
+): Promise<T | undefined> {
   const remainingMs = deadline - Date.now();
   if (remainingMs <= 0) {
     debugLog(`📊 Langfuse: Skipped ${label}; shutdown deadline elapsed`);
@@ -162,10 +174,31 @@ async function withShutdownDeadline<T>(label: string, startOperation: () => Prom
         }, remainingMs);
       }),
     ]);
+  } catch (error) {
+    if (signal?.aborted && isAbortError(error)) {
+      debugLog(`📊 Langfuse: ${label} aborted; shutdown deadline elapsed`);
+      return undefined;
+    }
+    throw error;
   } finally {
     if (timeout) {
       clearTimeout(timeout);
     }
+  }
+}
+
+async function runShutdownStep<T>(
+  label: string,
+  startOperation: () => Promise<T> | undefined,
+  deadline: number,
+  signal?: AbortSignal,
+): Promise<T | undefined> {
+  try {
+    return await withShutdownDeadline(label, startOperation, deadline, signal);
+  } catch (error) {
+    rememberRuntimeError(`runtime shutdown: ${label}`, error);
+    console.warn(`📊 Langfuse: Failed ${label} during shutdown`, error);
+    return undefined;
   }
 }
 
@@ -436,10 +469,51 @@ function wrapObservation(
   };
 }
 
-async function traceExists(rt: LangfuseRuntime, traceId: string, signal: AbortSignal): Promise<boolean> {
+async function getLegacyTraceApiCapability(
+  rt: LangfuseRuntime,
+  store: RestFallbackStore,
+  signal: AbortSignal,
+): Promise<LegacyTraceApiCapability | undefined> {
+  if (store.legacyTraceApi) {
+    return store.legacyTraceApi;
+  }
+
   const config = getRuntimeConfig(rt);
   if (!config) {
-    return false;
+    return undefined;
+  }
+
+  try {
+    const response = await fetch(`${config.host.replace(/\/$/, "")}/api/public/traces?limit=1`, {
+      headers: ingestionHeaders(rt),
+      signal,
+    });
+    if (response.status === 404) {
+      store.legacyTraceApi = "unsupported";
+      return store.legacyTraceApi;
+    }
+    if (!response.ok) {
+      return undefined;
+    }
+    store.legacyTraceApi = "supported";
+    return store.legacyTraceApi;
+  } catch (error) {
+    if (signal.aborted) {
+      throw error;
+    }
+    return undefined;
+  }
+}
+
+async function getTraceVisibility(
+  rt: LangfuseRuntime,
+  store: RestFallbackStore,
+  traceId: string,
+  signal: AbortSignal,
+): Promise<TraceVisibility> {
+  const config = getRuntimeConfig(rt);
+  if (!config) {
+    return "unknown";
   }
 
   try {
@@ -451,31 +525,41 @@ async function traceExists(rt: LangfuseRuntime, traceId: string, signal: AbortSi
       },
     );
     if (response.status === 404) {
-      return false;
+      const capability = await getLegacyTraceApiCapability(rt, store, signal);
+      if (capability === "supported") {
+        return "missing";
+      }
+      return capability === "unsupported" ? "legacy-api-unsupported" : "unknown";
     }
     if (!response.ok) {
-      throw new Error(`Langfuse trace visibility check failed with HTTP ${response.status}`);
+      return "unknown";
     }
-    return true;
+    return "visible";
   } catch (error) {
     if (signal.aborted) {
       throw error;
     }
-    return false;
+    return "unknown";
   }
 }
 
-async function waitForTraceVisibility(rt: LangfuseRuntime, traceId: string, signal: AbortSignal): Promise<boolean> {
+async function waitForTraceVisibility(
+  rt: LangfuseRuntime,
+  store: RestFallbackStore,
+  traceId: string,
+  signal: AbortSignal,
+): Promise<TraceVisibility> {
   const deadline = Date.now() + OTEL_VISIBILITY_TIMEOUT_MS;
 
   while (true) {
-    if (await traceExists(rt, traceId, signal)) {
-      return true;
+    const visibility = await getTraceVisibility(rt, store, traceId, signal);
+    if (visibility !== "missing") {
+      return visibility;
     }
 
     const remainingMs = deadline - Date.now();
     if (remainingMs <= 0) {
-      return false;
+      return "missing";
     }
 
     await delay(Math.min(OTEL_VISIBILITY_POLL_INTERVAL_MS, remainingMs), signal);
@@ -493,7 +577,12 @@ async function fallbackToRestIngestion(rt: LangfuseRuntime, signal: AbortSignal)
   }
   store.attempted = true;
 
-  if (await waitForTraceVisibility(rt, store.trace.id, signal)) {
+  const visibility = await waitForTraceVisibility(rt, store, store.trace.id, signal);
+  if (visibility === "visible") {
+    return;
+  }
+  if (visibility !== "missing") {
+    debugLog(`📊 Langfuse: Skipped REST fallback; trace visibility is ${visibility}`);
     return;
   }
 
@@ -654,32 +743,37 @@ function doShutdownRuntime(): Promise<void> {
     const controller = new AbortController();
     const abortTimeout = setTimeout(() => controller.abort(), shutdownStepTimeoutMs);
     const scoreController = new AbortController();
+    const scoreShutdownTimeoutMs = Math.min(getScoreShutdownTimeoutMs(), shutdownStepTimeoutMs);
+    const scoreDeadline = Math.min(deadline, Date.now() + scoreShutdownTimeoutMs);
     const scoreAbortTimeout = setTimeout(
       () => scoreController.abort(),
-      Math.min(getScoreShutdownTimeoutMs(), shutdownStepTimeoutMs),
+      scoreShutdownTimeoutMs,
     );
     scoreAbortTimeout.unref?.();
     stopScoreFlush(rt);
 
     try {
-      await withShutdownDeadline(
+      await runShutdownStep(
         "Active score flush",
         () => rt.scoreFlushPromise,
         deadline,
       );
-      await flushPendingScores(rt, scoreController.signal);
-      await withShutdownDeadline("OTel force flush", () => rt.tracerProvider?.forceFlush?.(), deadline);
-      await withShutdownDeadline(
+      await runShutdownStep(
+        "Pending score flush",
+        () => flushPendingScores(rt, scoreController.signal),
+        scoreDeadline,
+        scoreController.signal,
+      );
+      await runShutdownStep("OTel force flush", () => rt.tracerProvider?.forceFlush?.(), deadline);
+      await runShutdownStep("Langfuse score flush", () => rt.scoreClient.flush?.(), deadline);
+      await runShutdownStep("Langfuse client shutdown", () => rt.scoreClient.shutdown?.(), deadline);
+      await runShutdownStep("OTel tracer shutdown", () => rt.tracerProvider?.shutdown?.(), deadline);
+      await runShutdownStep(
         "REST fallback ingestion",
         () => fallbackToRestIngestion(rt, controller.signal),
         deadline,
+        controller.signal,
       );
-      await withShutdownDeadline("Langfuse score flush", () => rt.scoreClient.flush?.(), deadline);
-      await withShutdownDeadline("Langfuse client shutdown", () => rt.scoreClient.shutdown?.(), deadline);
-      await withShutdownDeadline("OTel tracer shutdown", () => rt.tracerProvider?.shutdown?.(), deadline);
-    } catch (e) {
-      rememberRuntimeError("runtime shutdown", e);
-      console.warn("📊 Langfuse: Failed to flush/shutdown cleanly", e);
     } finally {
       clearTimeout(abortTimeout);
       clearTimeout(scoreAbortTimeout);
