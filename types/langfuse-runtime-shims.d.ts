@@ -1,6 +1,6 @@
 declare module "@opentelemetry/sdk-trace-base" {
   export class BasicTracerProvider {
-    constructor(options?: { spanProcessors?: unknown[] });
+    constructor(options?: { resource?: unknown; spanProcessors?: unknown[] });
     forceFlush?(): Promise<void>;
     shutdown?(): Promise<void>;
   }

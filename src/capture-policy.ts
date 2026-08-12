@@ -1,4 +1,4 @@
-import { redactValue } from "./redaction.js";
+import { hashPath, redactValue } from "./redaction.js";
 
 export interface CapturePolicy {
   readonly captureInputs: boolean;
@@ -6,6 +6,7 @@ export interface CapturePolicy {
   readonly captureToolIo: boolean;
   readonly captureSystemPrompt: boolean;
   readonly captureCwd: boolean;
+  readonly captureSourceMetadata: boolean;
 }
 
 export type PrivacyPreset = "metadata-only" | "prompts-only" | "conversations" | "full-debug";
@@ -36,6 +37,7 @@ const PRESETS: Record<PrivacyPreset, CapturePolicy> = {
     captureToolIo: false,
     captureSystemPrompt: false,
     captureCwd: false,
+    captureSourceMetadata: false,
   },
   "prompts-only": {
     captureInputs: true,
@@ -43,6 +45,7 @@ const PRESETS: Record<PrivacyPreset, CapturePolicy> = {
     captureToolIo: false,
     captureSystemPrompt: false,
     captureCwd: false,
+    captureSourceMetadata: false,
   },
   conversations: {
     captureInputs: true,
@@ -50,6 +53,7 @@ const PRESETS: Record<PrivacyPreset, CapturePolicy> = {
     captureToolIo: false,
     captureSystemPrompt: false,
     captureCwd: false,
+    captureSourceMetadata: false,
   },
   "full-debug": {
     captureInputs: true,
@@ -57,6 +61,7 @@ const PRESETS: Record<PrivacyPreset, CapturePolicy> = {
     captureToolIo: true,
     captureSystemPrompt: true,
     captureCwd: true,
+    captureSourceMetadata: false,
   },
 };
 
@@ -66,6 +71,7 @@ const FLAG_TO_FIELD = {
   LANGFUSE_CAPTURE_TOOL_IO: "captureToolIo",
   LANGFUSE_CAPTURE_SYSTEM_PROMPT: "captureSystemPrompt",
   LANGFUSE_CAPTURE_CWD: "captureCwd",
+  LANGFUSE_CAPTURE_SOURCE_METADATA: "captureSourceMetadata",
 } as const;
 
 function parseFlag(value: string | undefined): boolean | undefined {
@@ -105,7 +111,13 @@ function redactMetadata(metadata: Record<string, unknown> | undefined, policy: C
 
   const output: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(metadata)) {
-    if (key === "cwd" && !policy.captureCwd) {
+    if (key === "cwd") {
+      if (!policy.captureCwd) {
+        continue;
+      }
+      output[key] = typeof value === "string" && /^(?:\/|[A-Za-z]:[\\/]|\\\\)/.test(value)
+        ? hashPath(value)
+        : redactValue(value);
       continue;
     }
     output[key] = redactValue(value);

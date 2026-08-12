@@ -22,6 +22,7 @@ test("env privacy flags override saved config capture policy", () => {
   const config = loadConfigFromFile(configPath, {
     LANGFUSE_PRIVACY_PRESET: "metadata-only",
     LANGFUSE_CAPTURE_INPUTS: "true",
+    LANGFUSE_CAPTURE_SOURCE_METADATA: "true",
   });
 
   assert.deepEqual(config?.capturePolicy, {
@@ -30,6 +31,7 @@ test("env privacy flags override saved config capture policy", () => {
     captureToolIo: false,
     captureSystemPrompt: false,
     captureCwd: false,
+    captureSourceMetadata: true,
   });
 });
 

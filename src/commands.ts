@@ -75,7 +75,7 @@ function isPrivacyPreset(value: string | undefined): value is PrivacyPreset {
 }
 
 function inferPreset(policy: CapturePolicy): PrivacyPreset | "custom" {
-  const entries: Array<[PrivacyPreset, CapturePolicy]> = [
+  const entries: Array<[PrivacyPreset, Omit<CapturePolicy, "captureSourceMetadata">]> = [
     [
       "metadata-only",
       {
@@ -139,6 +139,7 @@ function describePolicy(policy: CapturePolicy) {
     `captureToolIo: ${policy.captureToolIo}`,
     `captureSystemPrompt: ${policy.captureSystemPrompt}`,
     `captureCwd: ${policy.captureCwd}`,
+    `captureSourceMetadata: ${policy.captureSourceMetadata}`,
   ].join("\n");
 }
 

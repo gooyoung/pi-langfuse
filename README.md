@@ -108,7 +108,10 @@ export LANGFUSE_CAPTURE_OUTPUTS=true
 export LANGFUSE_CAPTURE_TOOL_IO=false
 export LANGFUSE_CAPTURE_SYSTEM_PROMPT=false
 export LANGFUSE_CAPTURE_CWD=false
+export LANGFUSE_CAPTURE_SOURCE_METADATA=false
 ```
+
+Source metadata remains off in every preset unless `LANGFUSE_CAPTURE_SOURCE_METADATA=true` is set explicitly.
 
 All captured payloads are redacted before upload. The extension masks common API keys, bearer tokens, passwords, cookies, private keys, Langfuse keys, GitHub/npm/AWS-style tokens, and local absolute paths.
 
@@ -198,50 +201,44 @@ The package also includes a Langfuse CLI skill, so Langfuse data can be queried 
 
 ## Source Metadata
 
-Local prototype note: source metadata support in this installed package is a local prototype patch. A durable solution should be shipped through an upstream PR, a fork, or a maintained package version so reinstalling the extension does not lose the behavior.
+Repository source capture is independent of the privacy presets and disabled by default. Enable it only after deciding that commit identity is appropriate for the Langfuse project:
 
-For Git-backed runs, the extension attaches safe source metadata to traces:
+```bash
+export LANGFUSE_CAPTURE_SOURCE_METADATA=true
+```
+
+For a Git worktree, the extension records only revision state:
 
 ```json
 {
   "source_type": "git-repo",
-  "repo_identity": "owner/repo",
-  "repo_owner": "owner",
-  "repo_name": "repo",
-  "repo_root_name": "repo",
-  "git_branch": "main",
-  "git_commit": "abc123",
-  "git_remote_host": "github.com",
-  "git_remote_path": "owner/repo",
+  "vcs.ref.head.revision": "0123456789abcdef...",
+  "git_detached": "false",
+  "git_dirty": "false",
   "metadata_source": "git-detection"
 }
 ```
 
-`repo_identity` is `owner/repo`. `repo_name` is the repo name only and must not contain a slash.
+The revision is the full `HEAD` commit. Dirty state includes tracked changes and untracked files, but never their paths or contents. Detached state is reported without a branch or tag name. Git remotes, URLs, credentials, usernames, branches, absolute paths, and repository names are never inspected or uploaded by this collector.
 
-A Git repo may optionally provide `.pi-langfuse.metadata.json`. Overrides are whitelist-only; unknown keys are ignored. Allowed keys are:
+When capture is off, the collector does not invoke Git and reports `source_type: "disabled"`. Non-Git directories report `non-git`; a missing or unusable Git executable and incomplete Git state report `unavailable`.
 
-```text
-repo_identity
-repo_owner
-repo_name
-source_type
-service_name
-project_slug
-environment
-observability_owner
+Use native Langfuse and OpenTelemetry settings for deployment identity and explicit operator-owned overrides instead of repository files:
+
+```bash
+export LANGFUSE_RELEASE="1.2.3"
+export LANGFUSE_TRACING_ENVIRONMENT="production"
+export OTEL_SERVICE_NAME="pi-agent"
+export OTEL_RESOURCE_ATTRIBUTES="service.version=1.2.3,vcs.repository.name=public-repo"
 ```
 
-Repo-local overrides are used only after the working directory is confirmed to be inside a usable Git repo. If Git detection fails for any reason, including a missing Git command, corrupted repo, or non-Git folder, the extension ignores repo-local identity files and emits only:
+`LANGFUSE_RELEASE` and `LANGFUSE_TRACING_ENVIRONMENT` keep their Langfuse semantics. `OTEL_SERVICE_NAME` and `OTEL_RESOURCE_ATTRIBUTES` are loaded as process-scoped OpenTelemetry resource attributes; values such as `vcs.repository.name` apply to every session sharing the runtime, may identify private source, and require a runtime restart to change.
 
-```json
-{
-  "source_type": "non-git",
-  "metadata_source": "non-git"
-}
-```
+### Compatibility and rollback
 
-The extension must not upload raw absolute local paths, credentialed remotes, tokens, unknown override keys, or folder names for non-Git folders.
+Earlier versions emitted `git_commit`, branch, remote, owner, repository, and repo-local `.pi-langfuse.metadata.json` values by default. New traces use `vcs.ref.head.revision` and stop reading that file. Update dashboards before enabling source capture; historical traces are unchanged.
+
+Unset `LANGFUSE_CAPTURE_SOURCE_METADATA` to stop collection immediately. Pin `pi-langfuse@1.5.12` only if the old schema is required during migration; doing so also restores its broader default source disclosure.
 
 ## Troubleshooting
 

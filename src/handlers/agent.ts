@@ -59,7 +59,8 @@ export async function startAgentRun(event: Record<string, unknown>, ctx: any) {
       images: event.images,
       context: event.context ?? event.attachments,
     });
-    const sourceMetadata = collectSourceMetadata(cwd);
+    const capturePolicy = getCapturePolicy();
+    const sourceMetadata = collectSourceMetadata(cwd, capturePolicy.captureSourceMetadata);
     const captured = applyCapturePolicy(
       {
         input: rawPromptInput,
@@ -71,7 +72,7 @@ export async function startAgentRun(event: Record<string, unknown>, ctx: any) {
           sessionId: state.currentSessionId || undefined,
         },
       },
-      getCapturePolicy(),
+      capturePolicy,
     );
 
     state.agentState = {
