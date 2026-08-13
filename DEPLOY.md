@@ -27,6 +27,18 @@ gh auth status
 git remote -v
 ```
 
+### Codex Desktop 与 macOS Keychain
+
+macOS 上的 `gh` 默认将 OAuth token 保存在 Keychain。Codex Desktop 的右侧终端可以正常读取
+Keychain，但普通沙箱命令可能无法读取，从而将“无法访问 keyring”误报为 `token is invalid`。
+
+遇到这种情况时：
+
+- 不要仅凭沙箱内的失败结果要求重新登录；
+- 先以授权的沙箱外执行方式复查 `gh auth status`；
+- 如果结果包含 `Logged in ... (keyring)`，认证有效，后续需要认证的 `gh` 命令也应以授权方式运行；
+- 不要使用 `--insecure-storage`，不要把 token 写入环境文件或仓库，也不要在日志中输出 token。
+
 ## 标准发布流程
 
 建议在 `main` 分支执行，且工作区保持干净。

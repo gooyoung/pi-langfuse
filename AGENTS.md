@@ -64,6 +64,17 @@ The main event flow is:
 - Treat config and credentials as sensitive. Never hardcode keys or commit local config artifacts.
 - Prefer minimal metadata additions. Langfuse payloads should stay readable and bounded.
 
+### GitHub CLI authentication in Codex Desktop
+
+- On macOS, `gh` stores OAuth credentials in Keychain. The Codex command sandbox may be unable to read
+  Keychain even when the right-side terminal is authenticated.
+- A sandboxed `gh auth status` failure that says the token is invalid is not sufficient evidence that the
+  credential has expired. Re-run the same read-only check with escalated/sandbox-exempt execution first.
+- If the escalated check reports `Logged in ... (keyring)`, treat GitHub CLI authentication as valid and run
+  subsequent authenticated `gh` commands with the required escalation.
+- Keep credentials in Keychain. Do not switch to insecure storage, copy tokens into repository files, or print
+  token values while diagnosing authentication.
+
 ## Config Behavior
 
 Config precedence is:
