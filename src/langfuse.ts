@@ -660,6 +660,7 @@ export async function getRuntime(): Promise<LangfuseRuntime> {
   if (!runtime) {
     const [
       { BasicTracerProvider },
+      { resources },
       { context },
       { AsyncHooksContextManager },
       { LangfuseSpanProcessor },
@@ -667,6 +668,7 @@ export async function getRuntime(): Promise<LangfuseRuntime> {
       { LangfuseClient },
     ] = await Promise.all([
       import("@opentelemetry/sdk-trace-base"),
+      import("@opentelemetry/sdk-node"),
       import("@opentelemetry/api"),
       import("@opentelemetry/context-async-hooks"),
       import("@langfuse/otel"),
@@ -692,7 +694,10 @@ export async function getRuntime(): Promise<LangfuseRuntime> {
         secretKey: state.config.secretKey,
         baseUrl: state.config.host,
       });
-      const tracerProvider = new BasicTracerProvider({ spanProcessors: [spanProcessor] });
+      const resource = resources.defaultResource().merge(
+        resources.detectResources({ detectors: [resources.envDetector] }),
+      );
+      const tracerProvider = new BasicTracerProvider({ resource, spanProcessors: [spanProcessor] });
       tracing.setLangfuseTracerProvider(tracerProvider);
 
       runtime = {

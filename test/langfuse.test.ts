@@ -353,6 +353,42 @@ test("runtime preserves the configured Langfuse OTel request timeout", async () 
   }
 });
 
+test("runtime reuses native OpenTelemetry resource environment overrides", async () => {
+  const previousServiceName = process.env.OTEL_SERVICE_NAME;
+  const previousResourceAttributes = process.env.OTEL_RESOURCE_ATTRIBUTES;
+  const previousConfig = state.config;
+
+  try {
+    process.env.OTEL_SERVICE_NAME = "pi-source-test";
+    process.env.OTEL_RESOURCE_ATTRIBUTES = "service.version=1.2.3,vcs.repository.name=public-repo";
+    state.config = {
+      publicKey: "pk_test",
+      secretKey: "sk_test",
+      host: "http://127.0.0.1:1",
+    };
+
+    const runtime = await getRuntime();
+    const attributes = (runtime.tracerProvider as any)._resource.attributes;
+
+    assert.equal(attributes["service.name"], "pi-source-test");
+    assert.equal(attributes["service.version"], "1.2.3");
+    assert.equal(attributes["vcs.repository.name"], "public-repo");
+  } finally {
+    await forceShutdownRuntime();
+    state.config = previousConfig;
+    if (previousServiceName === undefined) {
+      delete process.env.OTEL_SERVICE_NAME;
+    } else {
+      process.env.OTEL_SERVICE_NAME = previousServiceName;
+    }
+    if (previousResourceAttributes === undefined) {
+      delete process.env.OTEL_RESOURCE_ATTRIBUTES;
+    } else {
+      process.env.OTEL_RESOURCE_ATTRIBUTES = previousResourceAttributes;
+    }
+  }
+});
+
 test("buffered scores inherit the Langfuse tracing environment", async () => {
   const previousEnvironment = process.env.LANGFUSE_TRACING_ENVIRONMENT;
   const previousConfig = state.config;

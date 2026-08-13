@@ -12,7 +12,16 @@ test("defaults to full-debug capture to preserve existing trace detail", () => {
     captureToolIo: true,
     captureSystemPrompt: true,
     captureCwd: true,
+    captureSourceMetadata: false,
   });
+});
+
+test("source metadata stays disabled across privacy presets unless explicitly enabled", () => {
+  for (const preset of ["metadata-only", "prompts-only", "conversations", "full-debug"] as const) {
+    assert.equal(createCapturePolicy({ LANGFUSE_PRIVACY_PRESET: preset }).captureSourceMetadata, false);
+  }
+
+  assert.equal(createCapturePolicy({ LANGFUSE_CAPTURE_SOURCE_METADATA: "true" }).captureSourceMetadata, true);
 });
 
 test("metadata-only preset removes sensitive IO and cwd while keeping redacted metadata", () => {
@@ -42,6 +51,16 @@ test("metadata-only preset removes sensitive IO and cwd while keeping redacted m
     model: "gpt-5",
     authorization: "[REDACTED_SECRET]",
   });
+});
+
+test("full-debug hashes arbitrary absolute cwd values", () => {
+  const captured = applyCapturePolicy(
+    { metadata: { cwd: "/var/lib/private-repository" } },
+    createCapturePolicy({}),
+  );
+
+  assert.match(String(captured.metadata?.cwd), /^\[PATH_HASH:[a-f0-9]{12}\]$/);
+  assert.ok(!JSON.stringify(captured).includes("private-repository"));
 });
 
 test("fine-grained flags override privacy presets", () => {

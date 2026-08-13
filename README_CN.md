@@ -108,7 +108,10 @@ export LANGFUSE_CAPTURE_OUTPUTS=true
 export LANGFUSE_CAPTURE_TOOL_IO=false
 export LANGFUSE_CAPTURE_SYSTEM_PROMPT=false
 export LANGFUSE_CAPTURE_CWD=false
+export LANGFUSE_CAPTURE_SOURCE_METADATA=false
 ```
+
+所有隐私预设默认都关闭源码元数据；只有显式设置 `LANGFUSE_CAPTURE_SOURCE_METADATA=true` 才会启用。
 
 所有被采集的负载在上传前仍会脱敏。扩展会隐藏常见 API key、Bearer token、密码、Cookie、私钥、Langfuse key、GitHub/npm/AWS 风格 token，并对本地绝对路径做 hash。
 
@@ -174,6 +177,47 @@ pi list
 ```text
 /pi-langfuse-langfuse <查询内容>
 ```
+
+## 源码元数据
+
+仓库源码采集独立于隐私预设，默认关闭。只有在确认提交标识适合写入当前 Langfuse 项目后才启用：
+
+```bash
+export LANGFUSE_CAPTURE_SOURCE_METADATA=true
+```
+
+对于 Git 工作树，扩展只记录修订状态：
+
+```json
+{
+  "source_type": "git-repo",
+  "vcs.ref.head.revision": "0123456789abcdef...",
+  "git_detached": "false",
+  "git_dirty": "false",
+  "metadata_source": "git-detection"
+}
+```
+
+修订值为完整的 `HEAD` 提交。dirty 状态包含已跟踪变更和未跟踪文件，但绝不包含路径或内容。detached 状态不会附带分支名或标签名。此采集器不会检查或上传 Git remote、URL、凭据、用户名、分支、绝对路径或仓库名。
+
+关闭采集时，扩展不会调用 Git，并报告 `source_type: "disabled"`。非 Git 目录报告 `non-git`；Git 不可用或仓库状态不完整时报告 `unavailable`。
+
+部署标识和显式覆盖应使用 Langfuse 与 OpenTelemetry 原生配置，而不是仓库文件：
+
+```bash
+export LANGFUSE_RELEASE="1.2.3"
+export LANGFUSE_TRACING_ENVIRONMENT="production"
+export OTEL_SERVICE_NAME="pi-agent"
+export OTEL_RESOURCE_ATTRIBUTES="service.version=1.2.3,vcs.repository.name=public-repo"
+```
+
+`LANGFUSE_RELEASE` 与 `LANGFUSE_TRACING_ENVIRONMENT` 保持 Langfuse 原生语义。`OTEL_SERVICE_NAME` 和 `OTEL_RESOURCE_ATTRIBUTES` 会作为进程级 OpenTelemetry resource attributes 加载；`vcs.repository.name` 等值会应用到共享同一 runtime 的所有会话，可能暴露私有源码身份，而且修改后需要重启 runtime。
+
+### 兼容与回滚
+
+旧版本默认发送 `git_commit`、分支、remote、owner、仓库名及 `.pi-langfuse.metadata.json` 中的值。新 trace 改用 `vcs.ref.head.revision`，并停止读取该文件。启用源码采集前应更新 dashboard；历史 trace 不受影响。
+
+取消设置 `LANGFUSE_CAPTURE_SOURCE_METADATA` 可立即停止采集。迁移期间只有在必须保留旧 schema 时才固定到 `pi-langfuse@1.5.12`；这样也会恢复旧版本更宽泛的默认源码披露。
 
 ## 故障排除
 
