@@ -115,6 +115,34 @@ export LANGFUSE_CAPTURE_SOURCE_METADATA=false
 
 所有被采集的负载在上传前仍会脱敏。扩展会隐藏常见 API key、Bearer token、密码、Cookie、私钥、Langfuse key、GitHub/npm/AWS 风格 token，并对本地绝对路径做 hash。
 
+### 负载上限
+
+上传前会对负载做整形：字符串会被截断，过深或过宽的结构会被裁剪。这些上限让 trace 保持精简，同时保护
+Langfuse 摄取管线。任何一项都可以覆盖（无需重新构建）：
+
+```bash
+export PI_LANGFUSE_MAX_STRING_LENGTH=12000       # 单字符串字符数（system prompt、输入）
+export PI_LANGFUSE_MAX_TOOL_PAYLOAD_LENGTH=24000 # 工具输入/输出字符数
+export PI_LANGFUSE_MAX_DEPTH=6                    # 最大嵌套深度
+export PI_LANGFUSE_MAX_ARRAY_ITEMS=50            # 数组保留的最大元素数
+export PI_LANGFUSE_MAX_OBJECT_KEYS=80            # 对象保留的最大键数
+export PI_LANGFUSE_MAX_PAYLOAD_NODES=2000        # 单个负载的最大总节点数
+```
+
+任意上限设置为 `0`、`off`、`none` 或 `unlimited` 即表示关闭该限制（采集完整值）；未设置或非法值回退到上方默认值。
+若想完整采集很大的 system prompt 或工具负载，可以调高或关闭相关限制（例如 `PI_LANGFUSE_MAX_STRING_LENGTH=off`）。
+
+REST 回退摄取会按字节切分，保证每个请求体都远低于 Langfuse 网关的负载限制（约 4.5MB）。以下变量控制切分预算
+与整个回退负载的硬上限：
+
+```bash
+export PI_LANGFUSE_MAX_INGESTION_BATCH_BYTES=4194304  # 单次请求体预算，默认 4MB
+
+export PI_LANGFUSE_MAX_FALLBACK_TOTAL_BYTES=33554432  # 整体负载上限，默认 32MB
+```
+
+当累积的回退负载超过 32MB 上限时，会跳过摄取并给出告警，而不是尝试一次注定失败的超大上传。
+
 ### 方式 3：持久化 `config.json`
 
 创建或更新 `~/.pi/agent/pi-langfuse/config.json`：

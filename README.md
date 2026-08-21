@@ -136,6 +136,19 @@ defaults shown above. To capture a very large system prompt or big tool
 payloads in full, raise or disable the relevant limit (e.g.
 `PI_LANGFUSE_MAX_STRING_LENGTH=off`).
 
+The REST fallback ingestion is chunked so each request body stays well below
+the Langfuse gateway's payload limit (~4.5MB). These knobs control the chunk
+budget and a hard ceiling for the whole fallback payload:
+
+```bash
+export PI_LANGFUSE_MAX_INGESTION_BATCH_BYTES=4194304  # per-request body budget, default 4MB
+
+export PI_LANGFUSE_MAX_FALLBACK_TOTAL_BYTES=33554432  # whole-payload ceiling, default 32MB
+```
+
+When the accumulated fallback payload exceeds the 32MB ceiling, ingestion is
+skipped with a warning instead of attempting an unrecoverably large upload.
+
 ### Method 3: Persistent `config.json`
 
 Create or update `~/.pi/agent/pi-langfuse/config.json`:

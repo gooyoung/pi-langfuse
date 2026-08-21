@@ -95,6 +95,11 @@ Relevant implementation details:
 - The runtime is created lazily in `src/langfuse.ts`.
 - OpenTelemetry export is the primary path.
 - If OTel accepts spans but the trace never becomes visible, the extension falls back to Langfuse REST ingestion.
+- REST fallback ingestion is chunked by serialized byte size (`DEFAULT_MAX_INGESTION_BATCH_BYTES`,
+  default 4MB) so a single request stays below the Langfuse gateway ~4.5MB body limit, and it is skipped
+  with a warning when the whole payload exceeds `DEFAULT_MAX_FALLBACK_TOTAL_BYTES` (default 32MB).
+  Both knobs are env-tunable (`PI_LANGFUSE_MAX_INGESTION_BATCH_BYTES`, `PI_LANGFUSE_MAX_FALLBACK_TOTAL_BYTES`).
+- `splitIngestionBatch()` preserves entries exactly across chunks; keep the trace-create entry first.
 - Scores are sent separately through the Langfuse client; they are not part of the OTel span export path.
 - Root trace IO is mirrored from the root agent observation when `setTraceIO()` is available.
 

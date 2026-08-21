@@ -69,6 +69,13 @@ const DEFAULT_SCORE_FLUSH_AT = 10;
 const DEFAULT_SCORE_FLUSH_INTERVAL_MS = 1_000;
 const MAX_SCORE_QUEUE_SIZE = 100_000;
 const MAX_SCORE_BATCH_SIZE = 100;
+// Langfuse gateways (incl. langfuse-dx.wair.ac.cn) reject ingestion bodies above
+// ~4.5MB with HTTP 413. Keep the default chunk budget safely below that limit.
+const DEFAULT_MAX_INGESTION_BATCH_BYTES = 4 * 1024 * 1024;
+// Hard ceiling for the whole REST fallback payload. Above this the fallback is
+// pointless (it would need dozens of requests during a bounded shutdown) and is
+// skipped with a warning.
+const DEFAULT_MAX_FALLBACK_TOTAL_BYTES = 32 * 1024 * 1024;
 
 let shutdownStepTimeoutMs = DEFAULT_SHUTDOWN_STEP_TIMEOUT_MS;
 
@@ -89,6 +96,22 @@ function getScoreShutdownTimeoutMs(): number {
     "PI_LANGFUSE_SCORE_SHUTDOWN_TIMEOUT",
     DEFAULT_SCORE_SHUTDOWN_TIMEOUT_MS / 1_000,
   ) * 1_000;
+}
+
+function getMaxIngestionBatchBytes(): number {
+  return resolvePositiveEnvNumber(
+    "PI_LANGFUSE_MAX_INGESTION_BATCH_BYTES",
+    DEFAULT_MAX_INGESTION_BATCH_BYTES,
+    true,
+  );
+}
+
+function getMaxFallbackTotalBytes(): number {
+  return resolvePositiveEnvNumber(
+    "PI_LANGFUSE_MAX_FALLBACK_TOTAL_BYTES",
+    DEFAULT_MAX_FALLBACK_TOTAL_BYTES,
+    true,
+  );
 }
 
 function delay(ms: number, signal?: AbortSignal) {
@@ -242,6 +265,41 @@ async function ingestBatch(rt: LangfuseRuntime, batch: unknown[], signal: AbortS
 
   const responseBody = JSON.parse(text) as { errors?: unknown[] };
   return Array.isArray(responseBody.errors) ? responseBody.errors : [];
+}
+
+function serializedBytes(value: unknown): number {
+  return Buffer.byteLength(JSON.stringify(value), "utf8");
+}
+
+/**
+ * Split an ingestion event list into chunks whose serialized request bodies each
+ * stay under `maxBytes`. Each chunk, when wrapped as `{ batch: chunk }`, matches
+ * the measurement exactly because entries are serialized individually and joined
+ * with single commas inside the `{"batch":[...]}` envelope.
+ */
+export function splitIngestionBatch(entries: unknown[], maxBytes: number): unknown[][] {
+  const serialized = entries.map((entry) => JSON.stringify(entry));
+  const envelopeBytes = Buffer.byteLength('{"batch":[]}');
+  const chunks: unknown[][] = [];
+  let chunk: unknown[] = [];
+  let chunkBytes = envelopeBytes;
+
+  for (let index = 0; index < serialized.length; index++) {
+    const entryBytes = Buffer.byteLength(serialized[index], "utf8");
+    const separators = chunk.length > 0 ? 1 : 0;
+    const projectedBytes = chunkBytes + entryBytes + separators;
+    if (chunk.length > 0 && projectedBytes > maxBytes) {
+      chunks.push(chunk);
+      chunk = [];
+      chunkBytes = envelopeBytes;
+    }
+    chunk.push(entries[index]);
+    chunkBytes += entryBytes + (chunk.length > 1 ? 1 : 0);
+  }
+  if (chunk.length > 0) {
+    chunks.push(chunk);
+  }
+  return chunks;
 }
 
 async function flushPendingScores(rt: LangfuseRuntime, signal: AbortSignal): Promise<void> {
@@ -587,7 +645,7 @@ async function fallbackToRestIngestion(rt: LangfuseRuntime, signal: AbortSignal)
   }
 
   const trace = store.trace;
-  const batch: any[] = [
+  const entries: any[] = [
     {
       type: "trace-create",
       id: randomUUID(),
@@ -627,7 +685,7 @@ async function fallbackToRestIngestion(rt: LangfuseRuntime, signal: AbortSignal)
           }
         : {}),
     };
-    batch.push({
+    entries.push({
       type: observation.type === "GENERATION" ? "generation-create" : "span-create",
       id: randomUUID(),
       timestamp: eventTimestamp(observation),
@@ -635,12 +693,39 @@ async function fallbackToRestIngestion(rt: LangfuseRuntime, signal: AbortSignal)
     });
   }
 
-  const errors = await ingestBatch(rt, batch, signal);
+  const maxTotalBytes = getMaxFallbackTotalBytes();
+  const totalBytes = serializedBytes({ batch: entries });
+  if (totalBytes > maxTotalBytes) {
+    const message = `REST fallback payload is ${(totalBytes / 1024 / 1024).toFixed(1)}MB, above the ${(maxTotalBytes / 1024 / 1024).toFixed(1)}MB ceiling; skipping fallback ingestion`;
+    rememberRuntimeError("REST fallback ingestion", new Error(message));
+    console.warn(`📊 Langfuse: ${message}`);
+    return;
+  }
+
+  const chunks = splitIngestionBatch(entries, getMaxIngestionBatchBytes());
+  const errors: unknown[] = [];
+  for (const chunk of chunks) {
+    if (signal.aborted) {
+      break;
+    }
+    try {
+      errors.push(...(await ingestBatch(rt, chunk, signal)));
+    } catch (error) {
+      if (signal.aborted && isAbortError(error)) {
+        break;
+      }
+      rememberRuntimeError("REST fallback ingestion", error);
+      console.warn("📊 Langfuse: REST fallback ingestion chunk failed", error);
+      errors.push(error instanceof Error ? error.message : String(error));
+    }
+  }
   if (errors.length > 0) {
     rememberRuntimeError("REST fallback ingestion", new Error(JSON.stringify(errors)));
     console.warn("📊 Langfuse: REST fallback ingestion reported errors", errors);
   } else {
-    debugLog(`📊 Langfuse: OTel trace ${trace.id} was not visible; wrote fallback trace via REST ingestion`);
+    debugLog(
+      `📊 Langfuse: OTel trace ${trace.id} was not visible; wrote fallback trace via REST ingestion (${chunks.length} chunk(s))`,
+    );
   }
 }
 

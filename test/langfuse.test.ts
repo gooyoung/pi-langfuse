@@ -1075,6 +1075,163 @@ test("REST fallback checks legacy API capability and ingests a missing trace", a
   }
 });
 
+test("REST fallback splits oversized ingestion payloads into byte-bounded batches", async () => {
+  const previousBatchBytes = process.env.PI_LANGFUSE_MAX_INGESTION_BATCH_BYTES;
+  const previousTotalBytes = process.env.PI_LANGFUSE_MAX_FALLBACK_TOTAL_BYTES;
+  const inbound: Array<{ body: unknown }> = [];
+  const originalFetch = globalThis.fetch;
+  const runtime = createTestRuntime({
+    runtimeConfig: {
+      publicKey: "pk-test",
+      secretKey: "sk-test",
+      host: "https://example.com",
+    },
+    restFallback: {
+      trace: {
+        id: "oversized-trace",
+        timestamp: new Date().toISOString(),
+        name: "pi-agent",
+      },
+      observations: Array.from({ length: 8 }, (_, index) => ({
+        id: `obs-${index}`,
+        traceId: "oversized-trace",
+        type: "GENERATION" as const,
+        name: `generation-${index}`,
+        startTime: new Date().toISOString(),
+        input: "x".repeat(200_000),
+      })),
+      observationById: new Map(),
+      attempted: false,
+    },
+  });
+  // Batch budget of 1MB forces multiple POSTs out of ~1.6MB of observations.
+  process.env.PI_LANGFUSE_MAX_INGESTION_BATCH_BYTES = `${1024 * 1024}`;
+  process.env.PI_LANGFUSE_MAX_FALLBACK_TOTAL_BYTES = `${32 * 1024 * 1024}`;
+  globalThis.fetch = (async (input, init) => {
+    const method = init?.method ?? "GET";
+    const url = String(input);
+    if (method === "POST") {
+      inbound.push({ body: JSON.parse(String(init?.body)) });
+      return new Response(JSON.stringify({ successes: [], errors: [] }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    if (url.endsWith("?limit=1")) {
+      return new Response(JSON.stringify({ data: [] }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    return new Response(null, { status: 404 });
+  }) as typeof fetch;
+
+  try {
+    __setRuntimeForTest(runtime, 2_000);
+    await forceShutdownRuntime();
+
+    assert.ok(inbound.length >= 2, `expected chunked ingestion, got ${inbound.length} POST(s)`);
+    for (const request of inbound) {
+      const bytes = Buffer.byteLength(JSON.stringify(request.body), "utf8");
+      assert.ok(
+        bytes <= 1024 * 1024,
+        `batch body ${bytes} bytes exceeds the configured 1MB budget`,
+      );
+    }
+    const eventIds = inbound
+      .flatMap((request) => (request.body as { batch?: Array<{ type: string }> }).batch ?? [])
+      .map((entry) => (entry as { type: string }).type);
+    assert.equal(eventIds.filter((type) => type === "trace-create").length, 1);
+    assert.equal(eventIds.filter((type) => type === "generation-create").length, 8);
+  } finally {
+    __setRuntimeForTest(null);
+    globalThis.fetch = originalFetch;
+    if (previousBatchBytes === undefined) {
+      delete process.env.PI_LANGFUSE_MAX_INGESTION_BATCH_BYTES;
+    } else {
+      process.env.PI_LANGFUSE_MAX_INGESTION_BATCH_BYTES = previousBatchBytes;
+    }
+    if (previousTotalBytes === undefined) {
+      delete process.env.PI_LANGFUSE_MAX_FALLBACK_TOTAL_BYTES;
+    } else {
+      process.env.PI_LANGFUSE_MAX_FALLBACK_TOTAL_BYTES = previousTotalBytes;
+    }
+  }
+});
+
+test("REST fallback warns and skips ingestion when the total payload exceeds the ceiling", async () => {
+  const previousTotalBytes = process.env.PI_LANGFUSE_MAX_FALLBACK_TOTAL_BYTES;
+  const previousBatchBytes = process.env.PI_LANGFUSE_MAX_INGESTION_BATCH_BYTES;
+  let postCalls = 0;
+  const originalFetch = globalThis.fetch;
+  const originalWarn = console.warn;
+  const warnings: unknown[][] = [];
+  const runtime = createTestRuntime({
+    runtimeConfig: {
+      publicKey: "pk-test",
+      secretKey: "sk-test",
+      host: "https://example.com",
+    },
+    restFallback: {
+      trace: {
+        id: "oversized-trace",
+        timestamp: new Date().toISOString(),
+        name: "pi-agent",
+      },
+      observations: Array.from({ length: 3 }, (_, index) => ({
+        id: `obs-${index}`,
+        traceId: "oversized-trace",
+        type: "SPAN" as const,
+        name: `span-${index}`,
+        startTime: new Date().toISOString(),
+        input: "y".repeat(1_000_000),
+      })),
+      observationById: new Map(),
+      attempted: false,
+    },
+  });
+  process.env.PI_LANGFUSE_MAX_FALLBACK_TOTAL_BYTES = `${2 * 1024 * 1024}`;
+  process.env.PI_LANGFUSE_MAX_INGESTION_BATCH_BYTES = `${1024 * 1024}`;
+  globalThis.fetch = (async (input, init) => {
+    const url = String(input);
+    if ((init?.method ?? "GET") === "POST") {
+      postCalls += 1;
+      return new Response(JSON.stringify({ successes: [], errors: [] }), { status: 200 });
+    }
+    if (url.endsWith("?limit=1")) {
+      return new Response(JSON.stringify({ data: [] }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    return new Response(null, { status: 404 });
+  }) as typeof fetch;
+  console.warn = (...args: unknown[]) => warnings.push(args);
+
+  try {
+    __setRuntimeForTest(runtime, 2_000);
+    await forceShutdownRuntime();
+
+    assert.equal(postCalls, 0);
+    assert.ok(warnings.length >= 1, "expected a warning about the oversized fallback payload");
+    assert.match(String(warnings[0]?.[0] ?? ""), /fallback payload/i);
+  } finally {
+    __setRuntimeForTest(null);
+    globalThis.fetch = originalFetch;
+    console.warn = originalWarn;
+    if (previousTotalBytes === undefined) {
+      delete process.env.PI_LANGFUSE_MAX_FALLBACK_TOTAL_BYTES;
+    } else {
+      process.env.PI_LANGFUSE_MAX_FALLBACK_TOTAL_BYTES = previousTotalBytes;
+    }
+    if (previousBatchBytes === undefined) {
+      delete process.env.PI_LANGFUSE_MAX_INGESTION_BATCH_BYTES;
+    } else {
+      process.env.PI_LANGFUSE_MAX_INGESTION_BATCH_BYTES = previousBatchBytes;
+    }
+  }
+});
+
 test("shutdown aborts stalled score HTTP work so a child process exits", async () => {
   const fixture = fileURLToPath(new URL("./fixtures/stalled-shutdown-child.ts", import.meta.url));
   const child = spawn(process.execPath, ["--import", "tsx", fixture], {
