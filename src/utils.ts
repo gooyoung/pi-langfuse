@@ -369,6 +369,24 @@ export function getMessageFromEvent(event: Record<string, unknown>): Record<stri
   return undefined;
 }
 
+/**
+ * Langfuse buckets usage and cost details by substring match on the key name:
+ * `input` rolls up into the Input row of the breakdown, `output` into Output,
+ * and anything matching neither falls into the catch-all Other row. Camel-cased
+ * `cacheWrite` lands in Other, so cache is reported outside the Input bucket it
+ * belongs to and never reaches Langfuse's own price table, which resolves
+ * usage types by exact key match (`price.usageType === key`) and therefore
+ * cannot price cache for providers that do not report cost themselves.
+ *
+ * These are the key names Langfuse documents for Anthropic-style caching.
+ * Pi reports `input` exclusive of cached tokens, so the buckets stay
+ * non-overlapping and nothing is double counted. Emitting both spellings would
+ * be worse than either: the canonical key would be counted in Input and the
+ * camel-cased duplicate again in Other.
+ */
+const CACHE_READ_KEY = "cache_read_input_tokens";
+const CACHE_WRITE_KEY = "cache_creation_input_tokens";
+
 export function extractUsage(messageOrEvent: Record<string, unknown>): Record<string, number> | undefined {
   const usage = (messageOrEvent.usage ??
     (messageOrEvent.message && typeof messageOrEvent.message === "object"
@@ -388,8 +406,8 @@ export function extractUsage(messageOrEvent: Record<string, unknown>): Record<st
     input,
     output,
     total,
-    ...(cacheRead ? { cacheRead } : {}),
-    ...(cacheWrite ? { cacheWrite } : {}),
+    ...(cacheRead ? { [CACHE_READ_KEY]: cacheRead } : {}),
+    ...(cacheWrite ? { [CACHE_WRITE_KEY]: cacheWrite } : {}),
   };
 }
 
@@ -405,12 +423,20 @@ export function extractCostDetails(messageOrEvent: Record<string, unknown>): Rec
 
   const input = Number(cost.input ?? cost.inputCost ?? 0);
   const output = Number(cost.output ?? cost.outputCost ?? 0);
-  const total = Number(cost.total ?? cost.totalCost ?? input + output);
-  if (input === 0 && output === 0 && total === 0) {
+  const cacheRead = Number(cost.cacheRead ?? cost.cache_read ?? 0);
+  const cacheWrite = Number(cost.cacheWrite ?? cost.cache_write ?? 0);
+  const total = Number(cost.total ?? cost.totalCost ?? input + output + cacheRead + cacheWrite);
+  if (input === 0 && output === 0 && cacheRead === 0 && cacheWrite === 0 && total === 0) {
     return undefined;
   }
 
-  return { input, output, total };
+  return {
+    input,
+    output,
+    total,
+    ...(cacheRead ? { [CACHE_READ_KEY]: cacheRead } : {}),
+    ...(cacheWrite ? { [CACHE_WRITE_KEY]: cacheWrite } : {}),
+  };
 }
 
 export function extractResponseMetadata(event: Record<string, unknown>): Record<string, unknown> {

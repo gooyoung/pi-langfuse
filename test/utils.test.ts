@@ -3,6 +3,8 @@ import assert from "node:assert/strict";
 
 import {
   extractAssistantOutput,
+  extractCostDetails,
+  extractUsage,
   extractModelParameters,
   normalizeContentForLangfuse,
   shapePayload,
@@ -162,4 +164,66 @@ test("extractAssistantOutput redacts toolCall arguments before stringifying Open
   assert.deepEqual(JSON.parse(output.tool_calls[0]?.function.arguments ?? ""), {
     password: "[REDACTED_SECRET]",
   });
+});
+
+test("extractUsage reports cache tokens under keys Langfuse buckets as input", () => {
+  const usage = extractUsage({
+    usage: { input: 2, output: 2546, cacheRead: 0, cacheWrite: 118208, totalTokens: 120756 },
+  });
+
+  assert.deepEqual(usage, {
+    input: 2,
+    output: 2546,
+    total: 120756,
+    cache_creation_input_tokens: 118208,
+  });
+
+  const bucketed = Object.entries(usage ?? {})
+    .filter(([key]) => key !== "total")
+    .reduce((sum, [, value]) => sum + value, 0);
+  assert.equal(bucketed, usage?.total);
+});
+
+test("extractCostDetails keeps cache cost so the breakdown adds up to total", () => {
+  const cost = extractCostDetails({
+    usage: {
+      cost: { input: 0.00001, output: 0.06365, cacheRead: 0, cacheWrite: 0.7388, total: 0.80246 },
+    },
+  });
+
+  assert.deepEqual(cost, {
+    input: 0.00001,
+    output: 0.06365,
+    total: 0.80246,
+    cache_creation_input_tokens: 0.7388,
+  });
+
+  const bucketed = Object.entries(cost ?? {})
+    .filter(([key]) => key !== "total")
+    .reduce((sum, [, value]) => sum + value, 0);
+  assert.equal(Number(bucketed.toFixed(10)), cost?.total);
+});
+
+test("extractCostDetails reports cache reads alongside input and output", () => {
+  const cost = extractCostDetails({
+    usage: {
+      cost: { input: 0.00001, output: 0.019725, cacheRead: 0.010993, cacheWrite: 0.00086875, total: 0.03159675 },
+    },
+  });
+
+  assert.equal(cost?.cache_read_input_tokens, 0.010993);
+  assert.equal(cost?.cache_creation_input_tokens, 0.00086875);
+});
+
+test("extractCostDetails still discards all-zero cost payloads so model pricing applies", () => {
+  assert.equal(
+    extractCostDetails({ usage: { cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } }),
+    undefined,
+  );
+});
+
+test("extractCostDetails derives total from cache-only cost data", () => {
+  const cost = extractCostDetails({ usage: { cost: { cacheRead: 0.25, cacheWrite: 0.75 } } });
+
+  assert.equal(cost?.total, 1);
 });
