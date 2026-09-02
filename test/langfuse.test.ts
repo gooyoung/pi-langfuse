@@ -1253,7 +1253,7 @@ test("shutdown aborts stalled score HTTP work so a child process exits", async (
   assert.deepEqual(result, { code: 0, timedOut: false });
 });
 
-test("child observations inherit the session so v4 session aggregates see them", async () => {
+test("child observations inherit every propagated trace attribute so v4 filters see them", async () => {
   const previousConfig = state.config;
   const sessionId = "01a05f0e-6ae6-714b-beb0-85eca447879a";
 
@@ -1266,15 +1266,22 @@ test("child observations inherit the session so v4 session aggregates see them",
     };
 
     const runtime = await getRuntime();
-    const sessionOf = (observation: unknown) =>
-      (observation as { otelSpan?: { attributes?: Record<string, unknown> } })?.otelSpan?.attributes?.[
-        "session.id"
-      ];
+    const attributesOf = (observation: unknown) =>
+      (observation as { otelSpan?: { attributes?: Record<string, unknown> } })?.otelSpan?.attributes ?? {};
 
     // Mirrors handlers/agent.ts: only the root is created inside the callback.
-    const root: any = runtime.propagateAttributes({ sessionId, traceName: "pi-agent" }, () =>
-      runtime.startObservation("pi-agent", { input: "hi" }, { asType: "agent" } as any),
+    const root: any = runtime.propagateAttributes(
+      {
+        sessionId,
+        userId: "user-1",
+        traceName: "pi-agent",
+        tags: ["pi", "cli"],
+        metadata: { model: "claude-sonnet-4", provider: "anthropic" },
+      },
+      () => runtime.startObservation("pi-agent", { input: "hi" }, { asType: "agent" } as any),
     );
+    // Observation-level metadata is per span and must not travel to children.
+    root.update({ metadata: { systemPrompt: "You are Pi." } });
     // Every later span is created from a separate event handler, outside it.
     const turn: any = root.startObservation("turn", {}, { asType: "span" });
     const generation: any = turn.startObservation("llm-generation", {}, { asType: "generation" });
@@ -1286,7 +1293,17 @@ test("child observations inherit the session so v4 session aggregates see them",
       ["llm-generation", generation],
       ["bash", tool],
     ] as const) {
-      assert.equal(sessionOf(observation), sessionId, `${name} must carry session.id`);
+      const attributes = attributesOf(observation);
+      assert.equal(attributes["session.id"], sessionId, `${name} must carry session.id`);
+      assert.equal(attributes["user.id"], "user-1", `${name} must carry user.id`);
+      assert.equal(attributes["langfuse.trace.name"], "pi-agent", `${name} must carry langfuse.trace.name`);
+      assert.deepEqual(attributes["langfuse.trace.tags"], ["pi", "cli"], `${name} must carry langfuse.trace.tags`);
+      assert.equal(attributes["langfuse.trace.metadata.model"], "claude-sonnet-4", `${name} must carry trace metadata`);
+      assert.equal(attributes["langfuse.trace.metadata.provider"], "anthropic", `${name} must carry trace metadata`);
+    }
+
+    for (const observation of [turn, generation, tool]) {
+      assert.equal(attributesOf(observation)["langfuse.observation.metadata.systemPrompt"], undefined);
     }
 
     for (const observation of [tool, generation, turn, root]) observation.end();

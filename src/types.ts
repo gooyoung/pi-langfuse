@@ -85,6 +85,7 @@ export interface LangfuseRuntime {
   propagateAttributes: (
     params: {
       sessionId?: string;
+      userId?: string;
       traceName?: string;
       metadata?: Record<string, string>;
       tags?: string[];
