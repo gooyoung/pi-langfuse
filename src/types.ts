@@ -1,5 +1,6 @@
 import type { CapturePolicy } from "./capture-policy.js";
 import type { PayloadLimits } from "./limits.js";
+import type { UsageOptions } from "./usage-options.js";
 
 export interface Config {
   publicKey: string;
@@ -7,6 +8,7 @@ export interface Config {
   host: string;
   capturePolicy?: CapturePolicy;
   limits?: PayloadLimits;
+  usage?: UsageOptions;
 }
 
 export interface LangfuseObservation {

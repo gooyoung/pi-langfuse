@@ -167,6 +167,33 @@ export PI_LANGFUSE_MAX_FALLBACK_TOTAL_BYTES=33554432  # 整体负载上限，默
 
 当累积的回退负载超过 32MB 上限时，会跳过摄取并给出告警，而不是尝试一次注定失败的超大上传。
 
+### 推理（reasoning）token
+
+Pi 会为 Anthropic、OpenAI Codex、OpenRouter、opencode-go 和 Qwen 上报推理（thinking）token。提供商将其计入
+`output`，扩展默认也原样上报整个 `output`，因此在 Langfuse 中看不到推理部分的占比。可显式开启，将其作为独立用量桶上报：
+
+```bash
+export PI_LANGFUSE_SPLIT_REASONING_TOKENS=true
+```
+
+也可以持久化到 `config.json`：
+
+```json
+{ "capture": { "PI_LANGFUSE_SPLIT_REASONING_TOKENS": "true" } }
+```
+
+开启后，一次消耗 37 个输出 token（其中 10 个为推理）的生成会上报为 `output: 27` 加
+`output_reasoning_tokens: 10`。两个键都包含 `output`，所以 Langfuse 的 Output 行仍显示 37，只是其下的明细多出推理占比。
+推理数会被限制在上报的 `output` 范围内，因此各桶之和始终等于总量。
+
+> **开启前请先检查模型价格。** Langfuse 按键名精确匹配用量与价格，且你在项目中自定义的模型定义优先于 Langfuse 维护的
+> 默认值。若自定义模型只定义了 `input` 和 `output` 价格，`output_reasoning_tokens` 会按零计价，推理密集的生成会显得比实际便宜。
+> 请先在 **Settings → Models** 中为每个自定义推理模型补上 `output_reasoning_tokens` 的价格，再开启拆分。Langfuse 内置的
+> 推理模型价格已包含该键。自行上报成本的提供商不受影响：Langfuse 会直接使用上报的成本，不会再根据用量重新计算。
+
+该拆分默认关闭，升级后在你显式开启之前不会有任何变化。取消设置 `PI_LANGFUSE_SPLIT_REASONING_TOKENS`（或设为 `false`）即可回退；
+已摄取的 trace 保留其原有用量桶。
+
 ### 方式 3：持久化 `config.json`
 
 创建或更新 `~/.pi/agent/pi-langfuse/config.json`：
@@ -222,6 +249,7 @@ pi list
 - trace 中会包含 Pi 实际显示的最终助手回复。
 - 工具执行会以工具观察节点展示参数、结果和错误状态。
 - 模型请求会以生成观察节点展示；如果提供商暴露相关信息，还会包含用量和成本。
+  开启 `PI_LANGFUSE_SPLIT_REASONING_TOKENS` 后，推理 token 会作为独立用量桶上报。
 - trace 级别会记录工具调用次数、工具成功率和是否出现错误。
 
 此包还包含一个内置 Langfuse 技能，可直接在 Pi 中查询 Langfuse 数据：
