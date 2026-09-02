@@ -109,11 +109,35 @@ export LANGFUSE_CAPTURE_TOOL_IO=false
 export LANGFUSE_CAPTURE_SYSTEM_PROMPT=false
 export LANGFUSE_CAPTURE_CWD=false
 export LANGFUSE_CAPTURE_SOURCE_METADATA=false
+export LANGFUSE_CAPTURE_PATHS=false
 ```
 
 所有隐私预设默认都关闭源码元数据；只有显式设置 `LANGFUSE_CAPTURE_SOURCE_METADATA=true` 才会启用。
+绝对路径与 `LANGFUSE_CAPTURE_PATHS` 同理。
 
 所有被采集的负载在上传前仍会脱敏。扩展会隐藏常见 API key、Bearer token、密码、Cookie、私钥、Langfuse key、GitHub/npm/AWS 风格 token，并对本地绝对路径做 hash。
+
+### 绝对路径
+
+默认情况下，本地绝对路径（`/Users/...`、`/home/...`、`/tmp/...`、`C:\Users\...`）会在所有位置被替换为
+稳定的 `[PATH_HASH:<12 位十六进制>]` 摘要，因此用户名和仓库名不会进入 Langfuse。该规则作用于输入、输出、
+工具 I/O、工具错误信息以及 `cwd` 元数据字段。若希望在 trace 中看到真实路径，需要显式开启：
+
+```bash
+export LANGFUSE_CAPTURE_PATHS=true
+```
+
+也可以持久化到 `config.json`：
+
+```json
+{ "capture": { "LANGFUSE_CAPTURE_PATHS": "true" } }
+```
+
+与 `LANGFUSE_CAPTURE_SOURCE_METADATA` 一样，它在所有隐私预设中默认关闭，且只影响路径；密钥脱敏（token、key、
+Cookie、密码）始终生效。注意 `LANGFUSE_CAPTURE_CWD=false` 是另一个控制项——它会直接丢弃 `cwd` 元数据字段，
+而不是改变路径的呈现方式。
+
+`/langfuse-status` 会在 `Capture: absolute paths` 下显示当前设置。
 
 ### 负载上限
 

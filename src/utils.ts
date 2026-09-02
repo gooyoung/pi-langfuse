@@ -1,5 +1,5 @@
 import { getLimits } from "./limits.js";
-import { createCapturePolicy, type CapturePolicy } from "./capture-policy.js";
+import { createCapturePolicy, redactOptionsFor, type CapturePolicy } from "./capture-policy.js";
 import { redactValue } from "./redaction.js";
 import { state } from "./state.js";
 
@@ -140,6 +140,7 @@ export function shapePayload(
   return options.redact === false
     ? shaped
     : redactValue(shaped, {
+        ...redactOptionsFor(getCapturePolicy()),
         maxDepth: depth,
         maxStringLength: maxString,
         maxArrayItems,

@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { getLimits } from "./limits.js";
+import { state } from "./state.js";
 
 export const REDACTED = "[REDACTED_SECRET]";
 
@@ -8,8 +9,16 @@ export interface RedactOptions {
   maxArrayItems: number;
   maxObjectKeys: number;
   maxStringLength: number;
+  /** When false, absolute filesystem paths are emitted verbatim instead of `[PATH_HASH:...]`. */
+  redactPaths: boolean;
 }
 
+/**
+ * Fallback for callers that do not pass the resolved capture policy. Mirrors
+ * `getLimits()` by reading the session config, and defaults to redacting so a
+ * missing policy can never widen disclosure. Callers that hold a policy should
+ * pass `redactOptionsFor(policy)` instead of relying on this.
+ */
 function defaultOptions(): RedactOptions {
   const limits = getLimits();
   return {
@@ -17,6 +26,7 @@ function defaultOptions(): RedactOptions {
     maxArrayItems: limits.maxArrayItems,
     maxObjectKeys: limits.maxObjectKeys,
     maxStringLength: limits.maxString,
+    redactPaths: !(state.config?.capturePolicy?.capturePaths ?? false),
   };
 }
 
@@ -41,16 +51,20 @@ function truncate(value: string, maxStringLength: number): string {
 
 export function redactString(value: string, options: Partial<RedactOptions> = {}): string {
   const merged = { ...defaultOptions(), ...options };
-  const truncated = truncate(value, merged.maxStringLength);
-  return truncated
+  const secretsRedacted = truncate(value, merged.maxStringLength)
     .replace(PRIVATE_KEY_RE, REDACTED)
     .replace(BEARER_RE, REDACTED)
     .replace(KNOWN_TOKEN_RE, REDACTED)
-    .replace(SECRET_ASSIGNMENT_RE, (_match, key: string) => `${key}=${REDACTED}`)
-    .replace(ABSOLUTE_PATH_RE, (path: string) => {
-      const envSuffix = path.match(/([/\\]\.env(?:\.[A-Za-z0-9_-]+)?)$/)?.[1];
-      return `${hashPath(envSuffix ? path.slice(0, -envSuffix.length) : path)}${envSuffix ?? ""}`;
-    });
+    .replace(SECRET_ASSIGNMENT_RE, (_match, key: string) => `${key}=${REDACTED}`);
+
+  if (!merged.redactPaths) {
+    return secretsRedacted;
+  }
+
+  return secretsRedacted.replace(ABSOLUTE_PATH_RE, (path: string) => {
+    const envSuffix = path.match(/([/\\]\.env(?:\.[A-Za-z0-9_-]+)?)$/)?.[1];
+    return `${hashPath(envSuffix ? path.slice(0, -envSuffix.length) : path)}${envSuffix ?? ""}`;
+  });
 }
 
 function visit(value: unknown, options: RedactOptions, depth: number, seen: WeakSet<object>): unknown {

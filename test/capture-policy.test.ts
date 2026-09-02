@@ -13,6 +13,7 @@ test("defaults to full-debug capture to preserve existing trace detail", () => {
     captureSystemPrompt: true,
     captureCwd: true,
     captureSourceMetadata: false,
+    capturePaths: false,
   });
 });
 
