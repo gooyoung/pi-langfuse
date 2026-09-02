@@ -458,6 +458,32 @@ function observationType(asType?: string): FallbackObservationType {
   return asType === "generation" ? "GENERATION" : "SPAN";
 }
 
+/**
+ * Langfuse stamps propagated attributes onto a span in
+ * `LangfuseSpanProcessor.onStart(span, parentContext)`, reading them from the
+ * OTel context that was active when the span was created. `propagateAttributes`
+ * only seeds that context for the duration of its callback, so a child created
+ * later — from a separate event handler, outside the callback — is written with
+ * an empty `session.id`.
+ *
+ * That is invisible in the legacy data model, where the session lives on the
+ * trace, but Langfuse v4 stores `session_id` per event row and aggregates a
+ * session with `WHERE session_id != ''`. Unstamped children drop out of
+ * `sumMap(cost_details)` and `sumMap(usage_details)`, which is why such
+ * sessions report their trace count correctly but no cost and no usage at all.
+ *
+ * Re-entering the propagated context for every child keeps the whole tree in
+ * the session. The id is read back off the parent span rather than from
+ * `state.currentSessionId`, so a child created outside an active session scope
+ * still inherits whatever its parent was actually stamped with.
+ */
+const OTEL_SESSION_ID_ATTRIBUTE = "session.id";
+
+function readSessionId(observation: any): string | undefined {
+  const value = observation?.otelSpan?.attributes?.[OTEL_SESSION_ID_ATTRIBUTE];
+  return typeof value === "string" && value ? value : undefined;
+}
+
 function wrapObservation(
   observation: any,
   store: RestFallbackStore,
@@ -517,7 +543,12 @@ function wrapObservation(
       return observation.end();
     },
     startObservation(childName: string, childBody?: Record<string, unknown>, options?: { asType?: string }) {
-      const child = observation.startObservation(childName, childBody, options);
+      const inheritedSessionId = readSessionId(observation) ?? state.currentSessionId ?? undefined;
+      const propagate = runtime?.propagateAttributes;
+      const createChild = () => observation.startObservation(childName, childBody, options);
+      const child = inheritedSessionId && propagate
+        ? propagate({ sessionId: inheritedSessionId.slice(0, 200) }, createChild)
+        : createChild();
       return wrapObservation(child, store, childName, childBody, options?.asType, id);
     },
     setTraceIO(traceBody?: { input?: unknown; output?: unknown }) {

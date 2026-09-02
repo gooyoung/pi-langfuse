@@ -1252,3 +1252,70 @@ test("shutdown aborts stalled score HTTP work so a child process exits", async (
 
   assert.deepEqual(result, { code: 0, timedOut: false });
 });
+
+test("child observations inherit the session so v4 session aggregates see them", async () => {
+  const previousConfig = state.config;
+  const sessionId = "01a05f0e-6ae6-714b-beb0-85eca447879a";
+
+  try {
+    ensureOtelContextManager(context, AsyncHooksContextManager);
+    state.config = {
+      publicKey: "pk_test",
+      secretKey: "sk_test",
+      host: "http://127.0.0.1:1",
+    };
+
+    const runtime = await getRuntime();
+    const sessionOf = (observation: unknown) =>
+      (observation as { otelSpan?: { attributes?: Record<string, unknown> } })?.otelSpan?.attributes?.[
+        "session.id"
+      ];
+
+    // Mirrors handlers/agent.ts: only the root is created inside the callback.
+    const root: any = runtime.propagateAttributes({ sessionId, traceName: "pi-agent" }, () =>
+      runtime.startObservation("pi-agent", { input: "hi" }, { asType: "agent" } as any),
+    );
+    // Every later span is created from a separate event handler, outside it.
+    const turn: any = root.startObservation("turn", {}, { asType: "span" });
+    const generation: any = turn.startObservation("llm-generation", {}, { asType: "generation" });
+    const tool: any = turn.startObservation("bash", {}, { asType: "tool" });
+
+    for (const [name, observation] of [
+      ["pi-agent", root],
+      ["turn", turn],
+      ["llm-generation", generation],
+      ["bash", tool],
+    ] as const) {
+      assert.equal(sessionOf(observation), sessionId, `${name} must carry session.id`);
+    }
+
+    for (const observation of [tool, generation, turn, root]) observation.end();
+  } finally {
+    await forceShutdownRuntime();
+    state.config = previousConfig;
+  }
+});
+
+test("child observations without a known session are left unstamped", async () => {
+  const previousConfig = state.config;
+
+  try {
+    state.config = {
+      publicKey: "pk_test",
+      secretKey: "sk_test",
+      host: "http://127.0.0.1:1",
+    };
+
+    const runtime = await getRuntime();
+    const root: any = runtime.startObservation("pi-agent", {}, { asType: "agent" } as any);
+    const turn: any = root.startObservation("turn", {}, { asType: "span" });
+
+    assert.equal(turn?.otelSpan?.attributes?.["session.id"], undefined);
+
+    turn.end();
+    root.end();
+  } finally {
+    await forceShutdownRuntime();
+    state.config = previousConfig;
+  }
+});
