@@ -184,6 +184,82 @@ test("extractUsage reports cache tokens under keys Langfuse buckets as input", (
   assert.equal(bucketed, usage?.total);
 });
 
+test("extractUsage keeps the TTL-agnostic cache write key when no hour-TTL share is reported", () => {
+  // Pi emits cacheWrite1h: 0 on every Anthropic response that used the default TTL.
+  const usage = extractUsage({
+    usage: { input: 2, output: 2546, cacheRead: 0, cacheWrite: 118208, cacheWrite1h: 0, totalTokens: 120756 },
+  });
+
+  assert.deepEqual(usage, {
+    input: 2,
+    output: 2546,
+    total: 120756,
+    cache_creation_input_tokens: 118208,
+  });
+});
+
+test("extractUsage splits cache writes by TTL when an hour-TTL share is reported", () => {
+  // Pi reports cacheWrite1h as a subset of cacheWrite, not alongside it.
+  const usage = extractUsage({
+    usage: { input: 2, output: 2546, cacheRead: 0, cacheWrite: 118208, cacheWrite1h: 18208, totalTokens: 120756 },
+  });
+
+  assert.deepEqual(usage, {
+    input: 2,
+    output: 2546,
+    total: 120756,
+    input_cache_creation_5m: 100000,
+    input_cache_creation_1h: 18208,
+  });
+
+  const bucketed = Object.entries(usage ?? {})
+    .filter(([key]) => key !== "total")
+    .reduce((sum, [, value]) => sum + value, 0);
+  assert.equal(bucketed, usage?.total);
+
+  // Langfuse sums every key containing "input" into the Input row, so the split
+  // must not change what that row reports.
+  const inputRow = Object.entries(usage ?? {})
+    .filter(([key]) => key.includes("input"))
+    .reduce((sum, [, value]) => sum + value, 0);
+  assert.equal(inputRow, 118210);
+});
+
+test("extractUsage reports only the hour-TTL bucket when every cache write used the long TTL", () => {
+  const usage = extractUsage({
+    usage: { input: 10, output: 20, cacheWrite: 5000, cacheWrite1h: 5000, totalTokens: 5030 },
+  });
+
+  assert.deepEqual(usage, { input: 10, output: 20, total: 5030, input_cache_creation_1h: 5000 });
+});
+
+test("extractUsage clamps an hour-TTL share that exceeds the reported cache write total", () => {
+  const usage = extractUsage({
+    usage: { input: 10, output: 20, cacheWrite: 100, cacheWrite1h: 150, totalTokens: 130 },
+  });
+
+  assert.deepEqual(usage, { input: 10, output: 20, total: 130, input_cache_creation_1h: 100 });
+});
+
+test("extractCostDetails keeps cache write cost on the aggregate key when usage is split by TTL", () => {
+  // Pi prices the five-minute and one-hour shares at their own rates and reports
+  // only the sum, so there is no per-TTL cost figure to split.
+  const cost = extractCostDetails({
+    usage: {
+      cacheWrite: 118208,
+      cacheWrite1h: 18208,
+      cost: { input: 0.00001, output: 0.06365, cacheRead: 0, cacheWrite: 0.484248, total: 0.547908 },
+    },
+  });
+
+  assert.deepEqual(cost, {
+    input: 0.00001,
+    output: 0.06365,
+    total: 0.547908,
+    cache_creation_input_tokens: 0.484248,
+  });
+});
+
 test("extractCostDetails keeps cache cost so the breakdown adds up to total", () => {
   const cost = extractCostDetails({
     usage: {

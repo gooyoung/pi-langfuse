@@ -387,6 +387,40 @@ export function getMessageFromEvent(event: Record<string, unknown>): Record<stri
 const CACHE_READ_KEY = "cache_read_input_tokens";
 const CACHE_WRITE_KEY = "cache_creation_input_tokens";
 
+/**
+ * Anthropic prices one-hour cache writes at a different rate from the default
+ * five-minute ones, and Langfuse mirrors that with two TTL-specific usage keys.
+ * Pi reports the total under `cacheWrite` and the hour-TTL share of it under
+ * `cacheWrite1h`, so the two Langfuse buckets are `cacheWrite - cacheWrite1h`
+ * and `cacheWrite1h`. Both keys contain `input`, so the Input row of the
+ * breakdown is unchanged; only the price lookup differs.
+ */
+const CACHE_WRITE_5M_KEY = "input_cache_creation_5m";
+const CACHE_WRITE_1H_KEY = "input_cache_creation_1h";
+
+/**
+ * Pi emits `cacheWrite1h: 0` on every Anthropic-family response, so a zero
+ * carries no TTL information. Only a non-zero hour-TTL figure is a real
+ * breakdown; everything else stays on the TTL-agnostic key so dashboards and
+ * custom model prices keyed on it keep working.
+ */
+function splitCacheWrite(cacheWrite: number, cacheWrite1h: number): Record<string, number> {
+  if (!cacheWrite) {
+    return {};
+  }
+
+  const longWrite = Math.min(Math.max(cacheWrite1h, 0), cacheWrite);
+  if (!longWrite) {
+    return { [CACHE_WRITE_KEY]: cacheWrite };
+  }
+
+  const shortWrite = cacheWrite - longWrite;
+  return {
+    ...(shortWrite ? { [CACHE_WRITE_5M_KEY]: shortWrite } : {}),
+    [CACHE_WRITE_1H_KEY]: longWrite,
+  };
+}
+
 export function extractUsage(messageOrEvent: Record<string, unknown>): Record<string, number> | undefined {
   const usage = (messageOrEvent.usage ??
     (messageOrEvent.message && typeof messageOrEvent.message === "object"
@@ -401,13 +435,14 @@ export function extractUsage(messageOrEvent: Record<string, unknown>): Record<st
   const total = Number(usage.total ?? usage.totalTokens ?? usage.total_tokens ?? input + output);
   const cacheRead = Number(usage.cacheRead ?? usage.cache_read ?? usage.cachedTokens ?? 0);
   const cacheWrite = Number(usage.cacheWrite ?? usage.cache_write ?? 0);
+  const cacheWrite1h = Number(usage.cacheWrite1h ?? usage.cache_write_1h ?? 0);
 
   return {
     input,
     output,
     total,
     ...(cacheRead ? { [CACHE_READ_KEY]: cacheRead } : {}),
-    ...(cacheWrite ? { [CACHE_WRITE_KEY]: cacheWrite } : {}),
+    ...splitCacheWrite(cacheWrite, cacheWrite1h),
   };
 }
 
@@ -424,6 +459,9 @@ export function extractCostDetails(messageOrEvent: Record<string, unknown>): Rec
   const input = Number(cost.input ?? cost.inputCost ?? 0);
   const output = Number(cost.output ?? cost.outputCost ?? 0);
   const cacheRead = Number(cost.cacheRead ?? cost.cache_read ?? 0);
+  // Pi has no per-TTL cost figure: `cost.cacheWrite` already prices the
+  // five-minute and one-hour shares at their own rates and sums them, so the
+  // cost side stays on the aggregate key even when usage is split by TTL.
   const cacheWrite = Number(cost.cacheWrite ?? cost.cache_write ?? 0);
   const total = Number(cost.total ?? cost.totalCost ?? input + output + cacheRead + cacheWrite);
   if (input === 0 && output === 0 && cacheRead === 0 && cacheWrite === 0 && total === 0) {
