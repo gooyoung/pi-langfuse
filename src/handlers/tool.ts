@@ -12,7 +12,7 @@ import {
   getCapturePolicy,
   getLimits,
 } from "../utils.js";
-import { applyCapturePolicy } from "../capture-policy.js";
+import { applyCapturePolicy, redactOptionsFor } from "../capture-policy.js";
 import { redactString } from "../redaction.js";
 
 export async function startToolObservation(event: Record<string, unknown>) {
@@ -87,6 +87,7 @@ export async function finishToolObservation(event: Record<string, unknown>) {
     event;
 
   try {
+    const policy = getCapturePolicy();
     const shapedOutput = shapePayload(output, { maxString: getLimits().maxToolPayload });
     const captured = applyCapturePolicy(
       {
@@ -97,7 +98,7 @@ export async function finishToolObservation(event: Record<string, unknown>) {
           isError,
         },
       },
-      getCapturePolicy(),
+      policy,
     );
     const outputBytes = estimatePayloadBytes(captured.toolOutput, getLimits().maxToolPayload);
     const durationMs = Math.max(0, Date.now() - activeTool.startedAt);
@@ -106,7 +107,9 @@ export async function finishToolObservation(event: Record<string, unknown>) {
       .update({
         output: captured.toolOutput,
         level: isError ? "ERROR" : "DEFAULT",
-        statusMessage: isError ? redactString(truncate(String(event.error ?? output), 1_000)) : undefined,
+        statusMessage: isError
+          ? redactString(truncate(String(event.error ?? output), 1_000), redactOptionsFor(policy))
+          : undefined,
         metadata: {
           ...(captured.metadata ?? {}),
           durationMs,

@@ -32,7 +32,28 @@ test("env privacy flags override saved config capture policy", () => {
     captureSystemPrompt: false,
     captureCwd: false,
     captureSourceMetadata: true,
+    capturePaths: false,
   });
+});
+
+test("saved capture block enables absolute paths, and env still wins over it", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-langfuse-config-paths-"));
+  const configPath = join(dir, "config.json");
+  writeFileSync(
+    configPath,
+    JSON.stringify({
+      publicKey: "pk-lf-test",
+      secretKey: "sk-lf-test",
+      host: "https://cloud.langfuse.com",
+      capture: { LANGFUSE_CAPTURE_PATHS: "true" },
+    }),
+  );
+
+  assert.equal(loadConfigFromFile(configPath, {})?.capturePolicy?.capturePaths, true);
+  assert.equal(
+    loadConfigFromFile(configPath, { LANGFUSE_CAPTURE_PATHS: "false" })?.capturePolicy?.capturePaths,
+    false,
+  );
 });
 
 test("saved config is private and sanitized config does not reveal secret key", () => {

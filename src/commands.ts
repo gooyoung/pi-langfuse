@@ -75,7 +75,7 @@ function isPrivacyPreset(value: string | undefined): value is PrivacyPreset {
 }
 
 function inferPreset(policy: CapturePolicy): PrivacyPreset | "custom" {
-  const entries: Array<[PrivacyPreset, Omit<CapturePolicy, "captureSourceMetadata">]> = [
+  const entries: Array<[PrivacyPreset, Omit<CapturePolicy, "captureSourceMetadata" | "capturePaths">]> = [
     [
       "metadata-only",
       {
@@ -140,6 +140,7 @@ function describePolicy(policy: CapturePolicy) {
     `captureSystemPrompt: ${policy.captureSystemPrompt}`,
     `captureCwd: ${policy.captureCwd}`,
     `captureSourceMetadata: ${policy.captureSourceMetadata}`,
+    `capturePaths: ${policy.capturePaths}`,
   ].join("\n");
 }
 
@@ -218,6 +219,7 @@ function formatStatus(configPath: string, env: Record<string, string | undefined
     `  tool IO: ${flag(policy.captureToolIo)}`,
     `  system prompt: ${flag(policy.captureSystemPrompt)}`,
     `  cwd: ${flag(policy.captureCwd)}`,
+    `  absolute paths: ${flag(policy.capturePaths)}`,
     `Active run: ${hasActiveAgentObservation() ? "yes" : "no"}`,
     `Last error: ${lastErrorSummary()}`,
   ].join("\n");

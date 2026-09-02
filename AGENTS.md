@@ -89,6 +89,12 @@ Relevant implementation details:
 - `src/config.ts` loads saved config first, then env vars.
 - First-run setup is only attempted once per session via `state.setupAttemptedThisSession`.
 - Manual `/langfuse-setup` clears cached config and shuts down the runtime before reconfiguring.
+- Absolute-path hashing (`[PATH_HASH:...]`) is governed by `CapturePolicy.capturePaths`
+  (`LANGFUSE_CAPTURE_PATHS`). Like `captureSourceMetadata` it is `false` in every preset and is
+  excluded from `inferPreset()` in `src/commands.ts`. Callers that hold a policy pass
+  `redactOptionsFor(policy)` into `redactValue()`/`redactString()`; `defaultOptions()` in
+  `src/redaction.ts` falls back to `state.config?.capturePolicy` and defaults to hashing, so a
+  missing policy can never widen disclosure. Secret masking is never affected by this flag.
 
 ## Langfuse-Specific Notes
 

@@ -109,11 +109,37 @@ export LANGFUSE_CAPTURE_TOOL_IO=false
 export LANGFUSE_CAPTURE_SYSTEM_PROMPT=false
 export LANGFUSE_CAPTURE_CWD=false
 export LANGFUSE_CAPTURE_SOURCE_METADATA=false
+export LANGFUSE_CAPTURE_PATHS=false
 ```
 
 Source metadata remains off in every preset unless `LANGFUSE_CAPTURE_SOURCE_METADATA=true` is set explicitly.
+The same holds for absolute paths and `LANGFUSE_CAPTURE_PATHS`.
 
 All captured payloads are redacted before upload. The extension masks common API keys, bearer tokens, passwords, cookies, private keys, Langfuse keys, GitHub/npm/AWS-style tokens, and local absolute paths.
+
+### Absolute paths
+
+By default, local absolute paths (`/Users/...`, `/home/...`, `/tmp/...`, `C:\Users\...`) are
+replaced everywhere with a stable `[PATH_HASH:<12 hex chars>]` digest, so usernames and repository
+names never reach Langfuse. This applies to inputs, outputs, tool I/O, tool error messages, and the
+`cwd` metadata field. Opt in to see real paths in traces:
+
+```bash
+export LANGFUSE_CAPTURE_PATHS=true
+```
+
+Or persist it in `config.json`:
+
+```json
+{ "capture": { "LANGFUSE_CAPTURE_PATHS": "true" } }
+```
+
+Like `LANGFUSE_CAPTURE_SOURCE_METADATA`, this stays off in every privacy preset until it is set
+explicitly, and it only affects paths — secret masking (tokens, keys, cookies, passwords) is always
+on regardless. Note that `LANGFUSE_CAPTURE_CWD=false` is a different control: it drops the `cwd`
+metadata field entirely rather than changing how paths are rendered.
+
+`/langfuse-status` reports the current setting under `Capture: absolute paths`.
 
 ### Payload limits
 
