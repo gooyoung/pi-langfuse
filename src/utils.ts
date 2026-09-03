@@ -1,4 +1,5 @@
 import { getLimits } from "./limits.js";
+import { getUsageOptions, type UsageOptions } from "./usage-options.js";
 import { createCapturePolicy, redactOptionsFor, type CapturePolicy } from "./capture-policy.js";
 import { redactValue } from "./redaction.js";
 import { state } from "./state.js";
@@ -422,7 +423,43 @@ function splitCacheWrite(cacheWrite: number, cacheWrite1h: number): Record<strin
   };
 }
 
-export function extractUsage(messageOrEvent: Record<string, unknown>): Record<string, number> | undefined {
+/**
+ * Reasoning tokens are a subset of the completion, not a sibling of it: every
+ * provider Pi reports them for counts them inside `output`. Emitting them as an
+ * extra bucket alone would therefore inflate Output usage, so `output` is
+ * narrowed to the non-reasoning remainder first — the same conversion Langfuse
+ * applies to Gemini thought tokens in `OtelIngestionProcessor`. Both keys
+ * contain `output`, so Langfuse re-aggregates them into an unchanged Output row.
+ *
+ * Reasoning is clamped to the reported `output` so an inconsistent provider
+ * count cannot drive `output` negative or make the buckets stop summing to
+ * `total`.
+ *
+ * The split is opt-in (`PI_LANGFUSE_SPLIT_REASONING_TOKENS`). Langfuse prices
+ * usage by exact key and user-defined model prices shadow the maintained
+ * defaults, so a custom model priced on `output` alone would silently cost the
+ * reasoning share at zero the moment it moved to its own key. Off by default,
+ * `output` stays whole and reasoning is not reported, exactly as before.
+ */
+const REASONING_KEY = "output_reasoning_tokens";
+
+function splitReasoning(output: number, reasoning: number, enabled: boolean): Record<string, number> {
+  if (!enabled) {
+    return { output };
+  }
+
+  const bounded = Math.min(Math.max(reasoning, 0), output);
+  if (!bounded) {
+    return { output };
+  }
+
+  return { output: output - bounded, [REASONING_KEY]: bounded };
+}
+
+export function extractUsage(
+  messageOrEvent: Record<string, unknown>,
+  options: UsageOptions = getUsageOptions(),
+): Record<string, number> | undefined {
   const usage = (messageOrEvent.usage ??
     (messageOrEvent.message && typeof messageOrEvent.message === "object"
       ? (messageOrEvent.message as Record<string, unknown>).usage
@@ -437,10 +474,13 @@ export function extractUsage(messageOrEvent: Record<string, unknown>): Record<st
   const cacheRead = Number(usage.cacheRead ?? usage.cache_read ?? usage.cachedTokens ?? 0);
   const cacheWrite = Number(usage.cacheWrite ?? usage.cache_write ?? 0);
   const cacheWrite1h = Number(usage.cacheWrite1h ?? usage.cache_write_1h ?? 0);
+  const reasoning = Number(
+    usage.reasoning ?? usage.reasoningTokens ?? usage.reasoning_tokens ?? usage.thoughtsTokenCount ?? 0,
+  );
 
   return {
     input,
-    output,
+    ...splitReasoning(output, reasoning, options.splitReasoningTokens),
     total,
     ...(cacheRead ? { [CACHE_READ_KEY]: cacheRead } : {}),
     ...splitCacheWrite(cacheWrite, cacheWrite1h),

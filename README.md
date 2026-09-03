@@ -175,6 +175,44 @@ export PI_LANGFUSE_MAX_FALLBACK_TOTAL_BYTES=33554432  # whole-payload ceiling, d
 When the accumulated fallback payload exceeds the 32MB ceiling, ingestion is
 skipped with a warning instead of attempting an unrecoverably large upload.
 
+### Reasoning tokens
+
+Pi reports reasoning (thinking) tokens for Anthropic, OpenAI Codex, OpenRouter,
+opencode-go and Qwen. Providers count them inside `output`, and by default the
+extension reports `output` whole, so the reasoning share is not visible in
+Langfuse. Opt in to report it as its own usage bucket:
+
+```bash
+export PI_LANGFUSE_SPLIT_REASONING_TOKENS=true
+```
+
+Or persist it in `config.json`:
+
+```json
+{ "capture": { "PI_LANGFUSE_SPLIT_REASONING_TOKENS": "true" } }
+```
+
+With the split on, a generation that used 37 output tokens of which 10 were
+reasoning is reported as `output: 27` plus `output_reasoning_tokens: 10`. Both
+keys contain `output`, so the Output row in Langfuse still shows 37; only the
+breakdown beneath it gains the reasoning share. Reasoning is clamped to the
+reported `output`, so the buckets always add up to the total.
+
+> **Before enabling — check your model prices.** Langfuse matches prices to
+> usage by exact key, and model definitions you created in your project take
+> precedence over Langfuse's maintained defaults. A custom model priced on
+> `input` and `output` only would cost `output_reasoning_tokens` at zero, so
+> reasoning-heavy generations would look cheaper than they are. Add a price
+> for `output_reasoning_tokens` to every custom reasoning model in
+> **Settings → Models** first, then turn the split on. Langfuse's built-in
+> prices for reasoning models already include it. Providers that report their
+> own cost are unaffected: Langfuse uses the reported cost as-is and does not
+> recompute it from usage.
+
+The split is off by default, so upgrading changes nothing until you enable it.
+Unset `PI_LANGFUSE_SPLIT_REASONING_TOKENS` (or set it to `false`) to go back;
+traces already ingested keep their buckets.
+
 ### Method 3: Persistent `config.json`
 
 Create or update `~/.pi/agent/pi-langfuse/config.json`:
@@ -230,6 +268,7 @@ This command makes a timeout-bounded authenticated request to Langfuse and, if i
 - The trace contains the final assistant output shown in Pi.
 - Tool runs appear as tool observations with arguments, results, and error state.
 - LLM requests appear as generation observations, including usage and cost when the provider exposes them.
+  Reasoning tokens are reported as their own usage bucket when `PI_LANGFUSE_SPLIT_REASONING_TOKENS` is enabled.
 - Trace-level scores include tool counts, tool success rate, and whether the run had errors.
 
 The package also includes a Langfuse CLI skill, so Langfuse data can be queried directly from Pi:

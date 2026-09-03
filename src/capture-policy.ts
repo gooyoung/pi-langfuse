@@ -90,7 +90,12 @@ const FLAG_TO_FIELD = {
   LANGFUSE_CAPTURE_PATHS: "capturePaths",
 } as const;
 
-function parseFlag(value: string | undefined): boolean | undefined {
+/**
+ * Parse a boolean env flag. `1/true/yes/on` and `0/false/no/off` are
+ * case-insensitive; anything else (including unset) is `undefined` so the
+ * caller keeps its default.
+ */
+export function parseFlag(value: string | undefined): boolean | undefined {
   if (value === undefined) {
     return undefined;
   }

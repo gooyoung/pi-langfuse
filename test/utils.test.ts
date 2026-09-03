@@ -303,3 +303,87 @@ test("extractCostDetails derives total from cache-only cost data", () => {
 
   assert.equal(cost?.total, 1);
 });
+
+const SPLIT_REASONING = { splitReasoningTokens: true } as const;
+
+function sumBuckets(usage: Record<string, number> | undefined): number {
+  return Object.entries(usage ?? {})
+    .filter(([key]) => key !== "total")
+    .reduce((sum, [, value]) => sum + value, 0);
+}
+
+test("extractUsage keeps output whole and drops reasoning unless the split is enabled", () => {
+  // Default: identical to the pre-split shape, so custom model prices keyed on
+  // `output` alone keep costing every completion token.
+  const usage = extractUsage(
+    { usage: { input: 96, output: 37, reasoning: 10, totalTokens: 133 } },
+    { splitReasoningTokens: false },
+  );
+
+  assert.deepEqual(usage, { input: 96, output: 37, total: 133 });
+  assert.equal(sumBuckets(usage), usage?.total);
+});
+
+test("extractUsage splits reasoning out of output without inflating the total", () => {
+  // Pi counts reasoning inside output for every provider that reports it.
+  const usage = extractUsage(
+    { usage: { input: 96, output: 37, reasoning: 10, totalTokens: 133 } },
+    SPLIT_REASONING,
+  );
+
+  assert.deepEqual(usage, {
+    input: 96,
+    output: 27,
+    total: 133,
+    output_reasoning_tokens: 10,
+  });
+  assert.equal(sumBuckets(usage), usage?.total);
+});
+
+test("extractUsage keeps Output usage whole once Langfuse re-aggregates the buckets", () => {
+  const usage = extractUsage(
+    { usage: { input: 2, output: 2546, reasoning: 180, totalTokens: 2548 } },
+    SPLIT_REASONING,
+  );
+
+  // Langfuse sums every key containing "output" into the Output row.
+  const outputRow = Object.entries(usage ?? {})
+    .filter(([key]) => key.includes("output"))
+    .reduce((sum, [, value]) => sum + value, 0);
+  assert.equal(outputRow, 2546);
+});
+
+test("extractUsage omits the reasoning bucket when the provider reports none", () => {
+  const usage = extractUsage({ usage: { input: 10, output: 20, totalTokens: 30 } }, SPLIT_REASONING);
+
+  assert.deepEqual(usage, { input: 10, output: 20, total: 30 });
+});
+
+test("extractUsage clamps reasoning to output so inconsistent counts still sum to total", () => {
+  const usage = extractUsage({ usage: { input: 5, output: 3, reasoning: 9, totalTokens: 8 } }, SPLIT_REASONING);
+
+  assert.deepEqual(usage, { input: 5, output: 0, total: 8, output_reasoning_tokens: 3 });
+  assert.equal(sumBuckets(usage), usage?.total);
+});
+
+test("extractUsage ignores a negative reasoning count", () => {
+  const usage = extractUsage({ usage: { input: 5, output: 3, reasoning: -4, totalTokens: 8 } }, SPLIT_REASONING);
+
+  assert.deepEqual(usage, { input: 5, output: 3, total: 8 });
+});
+
+test("extractUsage splits reasoning alongside cache buckets", () => {
+  const usage = extractUsage(
+    { usage: { input: 2, output: 2546, reasoning: 180, cacheWrite: 118208, cacheWrite1h: 0, totalTokens: 120756 } },
+    SPLIT_REASONING,
+  );
+
+  assert.deepEqual(usage, {
+    input: 2,
+    output: 2366,
+    total: 120756,
+    output_reasoning_tokens: 180,
+    cache_creation_input_tokens: 118208,
+  });
+  assert.equal(sumBuckets(usage), usage?.total);
+});
