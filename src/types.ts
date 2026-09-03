@@ -87,11 +87,18 @@ export interface LangfuseRuntime {
       sessionId?: string;
       userId?: string;
       traceName?: string;
+      version?: string;
       metadata?: Record<string, string>;
       tags?: string[];
     },
     fn: () => LangfuseObservation,
   ) => LangfuseObservation;
+  /**
+   * Runs `fn` on the OTel root context, so the observations it creates take
+   * their propagated attributes only from what is passed explicitly and not
+   * from whatever the caller's ambient context happens to carry.
+   */
+  withRootContext?: <T>(fn: () => T) => T;
   scoreClient: LangfuseScoreClient;
   spanProcessor?: { forceFlush?: () => Promise<void>; shutdown?: () => Promise<void> };
   tracerProvider?: { forceFlush?: () => Promise<void>; shutdown?: () => Promise<void> };

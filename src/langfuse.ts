@@ -479,6 +479,15 @@ function observationType(asType?: string): FallbackObservationType {
  * from state, so a child created outside an active session scope still
  * inherits whatever its parent was actually stamped with, and grandchildren
  * inherit transitively.
+ *
+ * The re-entry runs on the OTel root context, not the ambient one.
+ * `propagateAttributes` starts from `context.active()`, merges `metadata`
+ * and `tags` with whatever that context already carries, and stamps the
+ * active span if there is one. Any attributes propagated by the caller —
+ * another instrumentation, a foreign `propagateAttributes` scope — would
+ * otherwise leak into the child or onto an unrelated span. The parent is
+ * still explicit: `observation.startObservation` passes the parent span
+ * context to the child, so a clean ambient context changes nothing else.
  */
 type PropagatedAttributes = Parameters<LangfuseRuntime["propagateAttributes"]>[0];
 
@@ -486,6 +495,7 @@ const PROPAGATED_STRING_ATTRIBUTES = {
   sessionId: "session.id",
   userId: "user.id",
   traceName: "langfuse.trace.name",
+  version: "langfuse.version",
 } as const;
 const OTEL_TRACE_TAGS_ATTRIBUTE = "langfuse.trace.tags";
 const OTEL_TRACE_METADATA_PREFIX = "langfuse.trace.metadata.";
@@ -588,9 +598,12 @@ function wrapObservation(
       }
       const propagate = runtime?.propagateAttributes;
       const createChild = () => observation.startObservation(childName, childBody, options);
-      const child = propagate && Object.keys(inherited).length > 0
-        ? propagate(inherited, createChild)
-        : createChild();
+      const createInheritingChild = propagate && Object.keys(inherited).length > 0
+        ? () => propagate(inherited, createChild)
+        : createChild;
+      const child = runtime?.withRootContext
+        ? runtime.withRootContext(createInheritingChild)
+        : createInheritingChild();
       return wrapObservation(child, store, childName, childBody, options?.asType, id);
     },
     setTraceIO(traceBody?: { input?: unknown; output?: unknown }) {
@@ -819,7 +832,7 @@ export async function getRuntime(): Promise<LangfuseRuntime> {
     const [
       { BasicTracerProvider },
       { resources },
-      { context },
+      { context, ROOT_CONTEXT },
       { AsyncHooksContextManager },
       { LangfuseSpanProcessor },
       tracing,
@@ -864,6 +877,7 @@ export async function getRuntime(): Promise<LangfuseRuntime> {
           return wrapObservation(observation, restFallback, name, body, options?.asType);
         }) as unknown as LangfuseRuntime["startObservation"],
         propagateAttributes: tracing.propagateAttributes as unknown as LangfuseRuntime["propagateAttributes"],
+        withRootContext: (fn) => context.with(ROOT_CONTEXT, fn),
         scoreClient: new LangfuseClient({
           publicKey: state.config.publicKey,
           secretKey: state.config.secretKey,
