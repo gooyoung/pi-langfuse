@@ -17,7 +17,7 @@ import type { LangfuseRuntime } from "../src/types.js";
 import { BasicTracerProvider } from "@opentelemetry/sdk-trace-base";
 import { LangfuseSpanProcessor } from "@langfuse/otel";
 import * as tracing from "@langfuse/tracing";
-import { context } from "@opentelemetry/api";
+import { context, trace } from "@opentelemetry/api";
 import { AsyncHooksContextManager } from "@opentelemetry/context-async-hooks";
 
 function never(): Promise<void> {
@@ -1253,7 +1253,7 @@ test("shutdown aborts stalled score HTTP work so a child process exits", async (
   assert.deepEqual(result, { code: 0, timedOut: false });
 });
 
-test("child observations inherit the session so v4 session aggregates see them", async () => {
+test("child observations inherit every propagated trace attribute so v4 filters see them", async () => {
   const previousConfig = state.config;
   const sessionId = "01a05f0e-6ae6-714b-beb0-85eca447879a";
 
@@ -1266,15 +1266,23 @@ test("child observations inherit the session so v4 session aggregates see them",
     };
 
     const runtime = await getRuntime();
-    const sessionOf = (observation: unknown) =>
-      (observation as { otelSpan?: { attributes?: Record<string, unknown> } })?.otelSpan?.attributes?.[
-        "session.id"
-      ];
+    const attributesOf = (observation: unknown) =>
+      (observation as { otelSpan?: { attributes?: Record<string, unknown> } })?.otelSpan?.attributes ?? {};
 
     // Mirrors handlers/agent.ts: only the root is created inside the callback.
-    const root: any = runtime.propagateAttributes({ sessionId, traceName: "pi-agent" }, () =>
-      runtime.startObservation("pi-agent", { input: "hi" }, { asType: "agent" } as any),
+    const root: any = runtime.propagateAttributes(
+      {
+        sessionId,
+        userId: "user-1",
+        traceName: "pi-agent",
+        version: "1.5.16",
+        tags: ["pi", "cli"],
+        metadata: { model: "claude-sonnet-4", provider: "anthropic" },
+      },
+      () => runtime.startObservation("pi-agent", { input: "hi" }, { asType: "agent" } as any),
     );
+    // Observation-level metadata is per span and must not travel to children.
+    root.update({ metadata: { systemPrompt: "You are Pi." } });
     // Every later span is created from a separate event handler, outside it.
     const turn: any = root.startObservation("turn", {}, { asType: "span" });
     const generation: any = turn.startObservation("llm-generation", {}, { asType: "generation" });
@@ -1286,10 +1294,108 @@ test("child observations inherit the session so v4 session aggregates see them",
       ["llm-generation", generation],
       ["bash", tool],
     ] as const) {
-      assert.equal(sessionOf(observation), sessionId, `${name} must carry session.id`);
+      const attributes = attributesOf(observation);
+      assert.equal(attributes["session.id"], sessionId, `${name} must carry session.id`);
+      assert.equal(attributes["user.id"], "user-1", `${name} must carry user.id`);
+      assert.equal(attributes["langfuse.trace.name"], "pi-agent", `${name} must carry langfuse.trace.name`);
+      assert.equal(attributes["langfuse.version"], "1.5.16", `${name} must carry langfuse.version`);
+      assert.deepEqual(attributes["langfuse.trace.tags"], ["pi", "cli"], `${name} must carry langfuse.trace.tags`);
+      assert.equal(attributes["langfuse.trace.metadata.model"], "claude-sonnet-4", `${name} must carry trace metadata`);
+      assert.equal(attributes["langfuse.trace.metadata.provider"], "anthropic", `${name} must carry trace metadata`);
+    }
+
+    for (const observation of [turn, generation, tool]) {
+      assert.equal(attributesOf(observation)["langfuse.observation.metadata.systemPrompt"], undefined);
     }
 
     for (const observation of [tool, generation, turn, root]) observation.end();
+  } finally {
+    await forceShutdownRuntime();
+    state.config = previousConfig;
+  }
+});
+
+test("child observations inherit from their parent only, not from the ambient OTel context", async () => {
+  const previousConfig = state.config;
+  const sessionId = "01a05f0e-6ae6-714b-beb0-85eca447879a";
+
+  try {
+    ensureOtelContextManager(context, AsyncHooksContextManager);
+    state.config = {
+      publicKey: "pk_test",
+      secretKey: "sk_test",
+      host: "http://127.0.0.1:1",
+    };
+
+    const runtime = await getRuntime();
+    const attributesOf = (observation: unknown) =>
+      (observation as { otelSpan?: { attributes?: Record<string, unknown> } })?.otelSpan?.attributes ?? {};
+
+    const root: any = runtime.propagateAttributes(
+      {
+        sessionId,
+        traceName: "pi-agent",
+        version: "1.5.16",
+        tags: ["pi"],
+        metadata: { model: "claude-sonnet-4" },
+      },
+      () => runtime.startObservation("pi-agent", { input: "hi" }, { asType: "agent" } as any),
+    );
+
+    // A foreign scope is active when the child is created: another
+    // instrumentation propagating its own attributes with its own span
+    // active. `propagateAttributes` merges tags and metadata with the active
+    // context and stamps the active span, so without a clean context the
+    // child would pick up the stranger's attributes and the stranger span
+    // would be stamped with ours.
+    const stranger: any = tracing.startObservation("stranger");
+    const turn: any = tracing.propagateAttributes(
+      {
+        sessionId: "ambient-session",
+        userId: "ambient-user",
+        traceName: "ambient-trace",
+        version: "9.9.9",
+        tags: ["ambient"],
+        metadata: { model: "ambient-model", intruder: "yes" },
+      },
+      () =>
+        context.with(trace.setSpan(context.active(), stranger.otelSpan), () =>
+          root.startObservation("turn", {}, { asType: "span" }),
+        ),
+    );
+
+    const attributes = attributesOf(turn);
+    assert.equal(attributes["session.id"], sessionId);
+    assert.equal(attributes["user.id"], undefined, "user.id must not leak in from the ambient context");
+    assert.equal(attributes["langfuse.trace.name"], "pi-agent");
+    assert.equal(attributes["langfuse.version"], "1.5.16");
+    assert.deepEqual(attributes["langfuse.trace.tags"], ["pi"], "tags must not be merged with the ambient context");
+    assert.equal(attributes["langfuse.trace.metadata.model"], "claude-sonnet-4");
+    assert.equal(
+      attributes["langfuse.trace.metadata.intruder"],
+      undefined,
+      "metadata must not be merged with the ambient context",
+    );
+
+    // The explicit parent still wins over the active span.
+    assert.equal(turn.otelSpan.parentSpanContext?.spanId, root.otelSpan.spanContext().spanId);
+    assert.equal(turn.otelSpan.spanContext().traceId, root.otelSpan.spanContext().traceId);
+
+    // And the stranger span is left alone.
+    const strangerAttributes = attributesOf(stranger);
+    assert.equal(strangerAttributes["session.id"], undefined, "stranger span must not be stamped with our session");
+    assert.equal(strangerAttributes["langfuse.trace.name"], undefined);
+
+    // A child created with nothing to inherit is not stamped from the ambient context either.
+    const bare: any = runtime.startObservation("bare", {}, { asType: "agent" } as any);
+    const bareChild: any = tracing.propagateAttributes(
+      { sessionId: "ambient-session", metadata: { intruder: "yes" } },
+      () => bare.startObservation("turn", {}, { asType: "span" }),
+    );
+    assert.equal(attributesOf(bareChild)["session.id"], undefined);
+    assert.equal(attributesOf(bareChild)["langfuse.trace.metadata.intruder"], undefined);
+
+    for (const observation of [bareChild, bare, turn, stranger, root]) observation.end();
   } finally {
     await forceShutdownRuntime();
     state.config = previousConfig;

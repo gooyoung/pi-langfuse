@@ -463,25 +463,73 @@ function observationType(asType?: string): FallbackObservationType {
  * `LangfuseSpanProcessor.onStart(span, parentContext)`, reading them from the
  * OTel context that was active when the span was created. `propagateAttributes`
  * only seeds that context for the duration of its callback, so a child created
- * later — from a separate event handler, outside the callback — is written with
- * an empty `session.id`.
+ * later — from a separate event handler, outside the callback — is written
+ * without `session.id`, `langfuse.trace.name`, or `langfuse.trace.metadata.*`.
  *
- * That is invisible in the legacy data model, where the session lives on the
- * trace, but Langfuse v4 stores `session_id` per event row and aggregates a
- * session with `WHERE session_id != ''`. Unstamped children drop out of
- * `sumMap(cost_details)` and `sumMap(usage_details)`, which is why such
- * sessions report their trace count correctly but no cost and no usage at all.
+ * That is invisible in the legacy data model, where those live on the trace,
+ * but Langfuse v4 stores them per event row and filters and aggregates over
+ * those rows: a session is `WHERE session_id != ''`, and cost by trace name
+ * matches `trace_name` on the generation itself. Unstamped children drop out
+ * of `sumMap(cost_details)` and `sumMap(usage_details)`, which is why such
+ * sessions and trace-name filters report a correct trace count but no cost
+ * and no usage at all.
  *
- * Re-entering the propagated context for every child keeps the whole tree in
- * the session. The id is read back off the parent span rather than from
- * `state.currentSessionId`, so a child created outside an active session scope
- * still inherits whatever its parent was actually stamped with.
+ * Re-entering the propagated context for every child keeps the whole tree
+ * queryable. The attributes are read back off the parent span rather than
+ * from state, so a child created outside an active session scope still
+ * inherits whatever its parent was actually stamped with, and grandchildren
+ * inherit transitively.
+ *
+ * The re-entry runs on the OTel root context, not the ambient one.
+ * `propagateAttributes` starts from `context.active()`, merges `metadata`
+ * and `tags` with whatever that context already carries, and stamps the
+ * active span if there is one. Any attributes propagated by the caller —
+ * another instrumentation, a foreign `propagateAttributes` scope — would
+ * otherwise leak into the child or onto an unrelated span. The parent is
+ * still explicit: `observation.startObservation` passes the parent span
+ * context to the child, so a clean ambient context changes nothing else.
  */
-const OTEL_SESSION_ID_ATTRIBUTE = "session.id";
+type PropagatedAttributes = Parameters<LangfuseRuntime["propagateAttributes"]>[0];
 
-function readSessionId(observation: any): string | undefined {
-  const value = observation?.otelSpan?.attributes?.[OTEL_SESSION_ID_ATTRIBUTE];
-  return typeof value === "string" && value ? value : undefined;
+const PROPAGATED_STRING_ATTRIBUTES = {
+  sessionId: "session.id",
+  userId: "user.id",
+  traceName: "langfuse.trace.name",
+  version: "langfuse.version",
+} as const;
+const OTEL_TRACE_TAGS_ATTRIBUTE = "langfuse.trace.tags";
+const OTEL_TRACE_METADATA_PREFIX = "langfuse.trace.metadata.";
+
+function readPropagatedAttributes(observation: any): PropagatedAttributes {
+  const attributes: Record<string, unknown> = observation?.otelSpan?.attributes ?? {};
+  const propagated: PropagatedAttributes = {};
+
+  for (const [key, attribute] of Object.entries(PROPAGATED_STRING_ATTRIBUTES)) {
+    const value = attributes[attribute];
+    if (typeof value === "string" && value) {
+      propagated[key as keyof typeof PROPAGATED_STRING_ATTRIBUTES] = value;
+    }
+  }
+
+  const tags = attributes[OTEL_TRACE_TAGS_ATTRIBUTE];
+  if (Array.isArray(tags)) {
+    const validTags = tags.filter((tag): tag is string => typeof tag === "string" && tag.length > 0);
+    if (validTags.length > 0) {
+      propagated.tags = validTags;
+    }
+  }
+
+  const metadata: Record<string, string> = {};
+  for (const [key, value] of Object.entries(attributes)) {
+    if (key.startsWith(OTEL_TRACE_METADATA_PREFIX) && typeof value === "string") {
+      metadata[key.slice(OTEL_TRACE_METADATA_PREFIX.length)] = value;
+    }
+  }
+  if (Object.keys(metadata).length > 0) {
+    propagated.metadata = metadata;
+  }
+
+  return propagated;
 }
 
 function wrapObservation(
@@ -543,12 +591,19 @@ function wrapObservation(
       return observation.end();
     },
     startObservation(childName: string, childBody?: Record<string, unknown>, options?: { asType?: string }) {
-      const inheritedSessionId = readSessionId(observation) ?? state.currentSessionId ?? undefined;
+      const inherited = readPropagatedAttributes(observation);
+      const fallbackSessionId = state.currentSessionId?.slice(0, 200);
+      if (!inherited.sessionId && fallbackSessionId) {
+        inherited.sessionId = fallbackSessionId;
+      }
       const propagate = runtime?.propagateAttributes;
       const createChild = () => observation.startObservation(childName, childBody, options);
-      const child = inheritedSessionId && propagate
-        ? propagate({ sessionId: inheritedSessionId.slice(0, 200) }, createChild)
-        : createChild();
+      const createInheritingChild = propagate && Object.keys(inherited).length > 0
+        ? () => propagate(inherited, createChild)
+        : createChild;
+      const child = runtime?.withRootContext
+        ? runtime.withRootContext(createInheritingChild)
+        : createInheritingChild();
       return wrapObservation(child, store, childName, childBody, options?.asType, id);
     },
     setTraceIO(traceBody?: { input?: unknown; output?: unknown }) {
@@ -777,7 +832,7 @@ export async function getRuntime(): Promise<LangfuseRuntime> {
     const [
       { BasicTracerProvider },
       { resources },
-      { context },
+      { context, ROOT_CONTEXT },
       { AsyncHooksContextManager },
       { LangfuseSpanProcessor },
       tracing,
@@ -822,6 +877,7 @@ export async function getRuntime(): Promise<LangfuseRuntime> {
           return wrapObservation(observation, restFallback, name, body, options?.asType);
         }) as unknown as LangfuseRuntime["startObservation"],
         propagateAttributes: tracing.propagateAttributes as unknown as LangfuseRuntime["propagateAttributes"],
+        withRootContext: (fn) => context.with(ROOT_CONTEXT, fn),
         scoreClient: new LangfuseClient({
           publicKey: state.config.publicKey,
           secretKey: state.config.secretKey,
