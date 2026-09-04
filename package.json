@@ -1,6 +1,6 @@
 {
 	"name": "pi-langfuse",
-	"version": "1.5.18",
+	"version": "1.5.19",
 	"description": "Langfuse extension for Pi coding agent",
 	"repository": {
 		"type": "git",
