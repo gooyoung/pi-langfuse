@@ -34,6 +34,7 @@
    - Langfuse 公钥，以 `pk-lf-...` 开头
    - Langfuse 密钥，以 `sk-lf-...` 开头
    - Langfuse 主机地址，默认 `https://cloud.langfuse.com`
+   - 可选的 Langfuse 用户 ID，用于按用户汇总用量和成本
 
 3. 正常运行 Pi：
 
@@ -63,7 +64,7 @@ Langfuse API 密钥可在 **Langfuse Cloud** -> **Settings** -> **API Keys** 中
 /langfuse-status
 ```
 
-状态命令会显示配置来源、主机地址、脱敏后的公钥、采集策略、是否有活跃运行、配置文件路径，以及最近一次运行时错误。
+状态命令会显示配置来源、主机地址、脱敏后的公钥、是否已配置用户 ID、采集策略、是否有活跃运行、配置文件路径，以及最近一次运行时错误，但不会输出用户 ID 本身。
 
 ### 方式 2：环境变量
 
@@ -73,9 +74,11 @@ Langfuse API 密钥可在 **Langfuse Cloud** -> **Settings** -> **API Keys** 中
 export LANGFUSE_PUBLIC_KEY="pk-lf-xxxx"
 export LANGFUSE_SECRET_KEY="sk-lf-xxxx"
 export LANGFUSE_BASE_URL="https://cloud.langfuse.com"  # 可选；也支持 LANGFUSE_HOST
+export LANGFUSE_USER_ID="user-123"                     # 可选；最长 200 个字符
 ```
 
 保存的配置优先级更高。只有当 `~/.pi/agent/pi-langfuse/config.json` 缺失或不完整时，扩展才会使用环境变量。
+如果已保存凭据但没有 `userId`，仍会读取 `LANGFUSE_USER_ID`；显式保存的 `userId` 优先级更高。
 
 对于短生命周期的 SDK 宿主，可设置关闭时最终分数发送尝试的上限：
 
@@ -203,9 +206,12 @@ export PI_LANGFUSE_SPLIT_REASONING_TOKENS=true
   "publicKey": "pk-lf-xxxx",
   "secretKey": "sk-lf-xxxx",
   "host": "https://cloud.langfuse.com",
+  "userId": "user-123",
   "privacyPreset": "conversations"
 }
 ```
+
+`userId` 是可选的显式配置，最长 200 个字符。扩展不会从本机操作系统账户推断该值。配置后，它会传播到 trace 中的每个 observation，以支持 Langfuse 按用户筛选并汇总成本。
 
 也可以持久化细粒度采集开关：
 

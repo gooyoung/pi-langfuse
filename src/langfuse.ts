@@ -29,6 +29,7 @@ interface RestFallbackTrace {
   input?: unknown;
   output?: unknown;
   sessionId?: string;
+  userId?: string;
   metadata?: Record<string, unknown>;
 }
 
@@ -558,12 +559,15 @@ function wrapObservation(
   store.observationById.set(id, record);
 
   if (!parentObservationId && !store.trace) {
+    const propagated = readPropagatedAttributes(observation);
     store.trace = {
       id: traceId,
       timestamp: record.startTime,
       name,
       input: body?.input,
-      sessionId: typeof metadata?.sessionId === "string" ? metadata.sessionId : state.currentSessionId || undefined,
+      sessionId: propagated.sessionId
+        ?? (typeof metadata?.sessionId === "string" ? metadata.sessionId : state.currentSessionId || undefined),
+      userId: propagated.userId ?? state.config?.userId,
       metadata,
     };
   }
@@ -743,6 +747,7 @@ async function fallbackToRestIngestion(rt: LangfuseRuntime, signal: AbortSignal)
         input: trace.input,
         output: trace.output,
         sessionId: trace.sessionId,
+        userId: trace.userId,
         metadata: trace.metadata,
       },
     },

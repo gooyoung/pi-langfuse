@@ -6,6 +6,7 @@ export interface Config {
   publicKey: string;
   secretKey: string;
   host: string;
+  userId?: string;
   capturePolicy?: CapturePolicy;
   limits?: PayloadLimits;
   usage?: UsageOptions;

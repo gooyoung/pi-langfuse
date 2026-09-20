@@ -211,6 +211,7 @@ function formatStatus(configPath: string, env: Record<string, string | undefined
     `Source: ${configSource(env, configPath)}`,
     `Host: ${safeConfig?.host ?? config.host}`,
     `Public key: ${safeConfig?.publicKey ?? "[REDACTED_SECRET]"}`,
+    `User ID: ${config.userId ? "configured" : "not set"}`,
     `Config file: ${configPath}`,
     `Privacy preset: ${inferPreset(policy)}`,
     "Capture:",

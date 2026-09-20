@@ -8,6 +8,16 @@ import { createCapturePolicy, type EnvLike } from "./capture-policy.js";
 import { createPayloadLimits } from "./limits.js";
 import { createUsageOptions } from "./usage-options.js";
 
+const MAX_LANGFUSE_USER_ID_LENGTH = 200;
+
+function normalizeUserId(value: unknown): string | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  const trimmed = value.trim();
+  return trimmed ? trimmed.slice(0, MAX_LANGFUSE_USER_ID_LENGTH) : undefined;
+}
+
 export function loadConfigFromFile(path = CONFIG_PATH, env: EnvLike = process.env as EnvLike): Config | null {
   if (existsSync(path)) {
     try {
@@ -23,6 +33,7 @@ export function loadConfigFromFile(path = CONFIG_PATH, env: EnvLike = process.en
           publicKey: config.publicKey,
           secretKey: config.secretKey,
           host: config.host || DEFAULT_LANGFUSE_HOST,
+          userId: normalizeUserId(config.userId) ?? normalizeUserId(env.LANGFUSE_USER_ID),
           capturePolicy: createCapturePolicy(captureSource),
           limits: createPayloadLimits(env),
           usage: createUsageOptions(captureSource),
@@ -47,6 +58,7 @@ export function loadConfigFromEnv(env: EnvLike = process.env as EnvLike): Config
     publicKey,
     secretKey,
     host: env.LANGFUSE_BASE_URL || env.LANGFUSE_HOST || DEFAULT_LANGFUSE_HOST,
+    userId: normalizeUserId(env.LANGFUSE_USER_ID),
     capturePolicy: createCapturePolicy(env),
     limits: createPayloadLimits(env),
     usage: createUsageOptions(env),
@@ -108,10 +120,12 @@ async function collectConfigFromUI(ctx: any, reason: string): Promise<Config | n
   }
 
   const hostInput = (await ctx.ui.input("Langfuse host:", DEFAULT_LANGFUSE_HOST))?.trim();
+  const userId = normalizeUserId(await ctx.ui.input("Langfuse user ID (optional):", ""));
   return {
     publicKey,
     secretKey,
     host: hostInput || DEFAULT_LANGFUSE_HOST,
+    ...(userId ? { userId } : {}),
     capturePolicy: createCapturePolicy(),
   };
 }

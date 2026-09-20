@@ -148,6 +148,7 @@ test("status command reports safe config and capture policy", async () => {
       publicKey: "pk-lf-1234567890abcdef",
       secretKey: "sk-lf-secret-value",
       host: "https://cloud.langfuse.com",
+      userId: "private-user-id",
       privacyPreset: "conversations",
     }),
   );
@@ -170,5 +171,7 @@ test("status command reports safe config and capture policy", async () => {
   assert.match(message, /State: configured/);
   assert.match(message, /Privacy preset: conversations/);
   assert.match(message, /Public key: pk-lf-.*cdef/);
+  assert.match(message, /User ID: configured/);
+  assert.doesNotMatch(message, /private-user-id/);
   assert.doesNotMatch(message, /sk-lf-secret-value/);
 });

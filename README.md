@@ -34,6 +34,7 @@ Langfuse observability extension for [Pi Coding Agent](https://github.com/earend
    - Langfuse public key, starting with `pk-lf-...`
    - Langfuse secret key, starting with `sk-lf-...`
    - Langfuse host, defaulting to `https://cloud.langfuse.com`
+   - Optional Langfuse user ID for per-user usage and cost aggregation
 
 3. Run Pi normally:
 
@@ -63,7 +64,7 @@ To inspect the active configuration without exposing secrets:
 /langfuse-status
 ```
 
-The status command reports the config source, host, masked public key, capture policy, active-run state, config path, and last runtime error.
+The status command reports the config source, host, masked public key, whether a user ID is configured, capture policy, active-run state, config path, and last runtime error. It never prints the user ID itself.
 
 ### Method 2: Environment variables
 
@@ -73,9 +74,11 @@ Set these before starting Pi:
 export LANGFUSE_PUBLIC_KEY="pk-lf-xxxx"
 export LANGFUSE_SECRET_KEY="sk-lf-xxxx"
 export LANGFUSE_BASE_URL="https://cloud.langfuse.com"  # optional; LANGFUSE_HOST is also supported
+export LANGFUSE_USER_ID="user-123"                     # optional; max 200 characters
 ```
 
 Saved config takes precedence. Environment variables are only used when `~/.pi/agent/pi-langfuse/config.json` is missing or incomplete.
+If saved credentials exist but `userId` is absent, `LANGFUSE_USER_ID` is still used. An explicitly saved `userId` takes precedence.
 
 For short-lived SDK hosts, set the bounded final score-delivery attempt during shutdown:
 
@@ -222,9 +225,12 @@ Create or update `~/.pi/agent/pi-langfuse/config.json`:
   "publicKey": "pk-lf-xxxx",
   "secretKey": "sk-lf-xxxx",
   "host": "https://cloud.langfuse.com",
+  "userId": "user-123",
   "privacyPreset": "conversations"
 }
 ```
+
+`userId` is optional, explicit-only, and limited to 200 characters. The extension does not infer it from the local operating-system account. When configured, it is propagated to every observation in the trace so Langfuse can provide per-user filtering and cost aggregation.
 
 Fine-grained capture flags can also be persisted:
 

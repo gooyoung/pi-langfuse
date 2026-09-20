@@ -96,6 +96,7 @@ export async function startAgentRun(event: Record<string, unknown>, ctx: any) {
     const root = rt.propagateAttributes(
       {
         sessionId: state.currentSessionId ? truncate(state.currentSessionId, 200) : undefined,
+        userId: state.config?.userId,
         traceName: "pi-agent",
         metadata: stringMetadata(captured.metadata),
       },

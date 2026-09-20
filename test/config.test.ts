@@ -4,7 +4,43 @@ import { mkdtempSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
-import { loadConfigFromFile, saveConfig, sanitizeConfigForLog } from "../src/config.ts";
+import { loadConfigFromEnv, loadConfigFromFile, saveConfig, sanitizeConfigForLog } from "../src/config.ts";
+
+test("loads and normalizes an optional user ID", () => {
+  const fromEnv = loadConfigFromEnv({
+    LANGFUSE_PUBLIC_KEY: "pk-lf-test",
+    LANGFUSE_SECRET_KEY: "sk-lf-test",
+    LANGFUSE_USER_ID: "  user-123  ",
+  });
+
+  assert.equal(fromEnv?.userId, "user-123");
+});
+
+test("saved user ID wins and the environment fills a missing saved user ID", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-langfuse-config-user-"));
+  const configPath = join(dir, "config.json");
+  const credentials = {
+    publicKey: "pk-lf-test",
+    secretKey: "sk-lf-test",
+    host: "https://cloud.langfuse.com",
+  };
+
+  writeFileSync(configPath, JSON.stringify({ ...credentials, userId: "saved-user" }));
+  assert.equal(loadConfigFromFile(configPath, { LANGFUSE_USER_ID: "env-user" })?.userId, "saved-user");
+
+  writeFileSync(configPath, JSON.stringify(credentials));
+  assert.equal(loadConfigFromFile(configPath, { LANGFUSE_USER_ID: "env-user" })?.userId, "env-user");
+});
+
+test("user ID is bounded to the Langfuse 200-character limit", () => {
+  const config = loadConfigFromEnv({
+    LANGFUSE_PUBLIC_KEY: "pk-lf-test",
+    LANGFUSE_SECRET_KEY: "sk-lf-test",
+    LANGFUSE_USER_ID: `  ${"u".repeat(250)}  `,
+  });
+
+  assert.equal(config?.userId, "u".repeat(200));
+});
 
 test("env privacy flags override saved config capture policy", () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-langfuse-config-"));

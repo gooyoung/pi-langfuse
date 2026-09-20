@@ -1025,6 +1025,7 @@ test("REST fallback checks legacy API capability and ingests a missing trace", a
         id: "fallback-trace",
         timestamp: new Date().toISOString(),
         name: "pi-agent",
+        userId: "user-123",
       },
       observations: [],
       observationById: new Map(),
@@ -1069,6 +1070,7 @@ test("REST fallback checks legacy API capability and ingests a missing trace", a
     const ingestion = requests.find((request) => request.method === "POST");
     assert.equal(ingestion?.url, "https://example.com/api/public/ingestion");
     assert.match(ingestion?.body ?? "", /"type":"trace-create"/);
+    assert.match(ingestion?.body ?? "", /"userId":"user-123"/);
   } finally {
     __setRuntimeForTest(null);
     globalThis.fetch = originalFetch;

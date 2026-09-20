@@ -141,6 +141,7 @@ test("startAgentRun keeps source metadata disabled by default", async () => {
   const root = mkdtempSync(join(tmpdir(), "pi-langfuse-source-agent-"));
   const previousConfig = state.config;
   let observedMetadata: Record<string, unknown> | undefined;
+  let propagatedAttributes: Parameters<LangfuseRuntime["propagateAttributes"]>[0] | undefined;
   const observation: LangfuseObservation = {
     traceId: "trace-test",
     update: () => observation,
@@ -152,7 +153,10 @@ test("startAgentRun keeps source metadata disabled by default", async () => {
       observedMetadata = body?.metadata;
       return observation;
     },
-    propagateAttributes: (_params: unknown, fn: () => LangfuseObservation) => fn(),
+    propagateAttributes: (params, fn) => {
+      propagatedAttributes = params;
+      return fn();
+    },
     scoreClient: {},
   } satisfies LangfuseRuntime;
 
@@ -164,6 +168,7 @@ test("startAgentRun keeps source metadata disabled by default", async () => {
       publicKey: "pk-test",
       secretKey: ["test", "value"].join("-"),
       host: "https://example.test",
+      userId: "user-123",
       capturePolicy: createCapturePolicy({}),
     };
     __setRuntimeForTest(runtime);
@@ -175,6 +180,7 @@ test("startAgentRun keeps source metadata disabled by default", async () => {
     assert.equal(observedMetadata?.["vcs.ref.head.revision"], undefined);
     assert.match(String(observedMetadata?.cwd), /^\[PATH_HASH:[a-f0-9]{12}\]$/);
     assert.ok(!JSON.stringify(observedMetadata).includes("private-client-alice"));
+    assert.equal(propagatedAttributes?.userId, "user-123");
   } finally {
     __setRuntimeForTest(null);
     state.config = previousConfig;
