@@ -13,6 +13,9 @@ feature documentation, prefer `README.md` and `README_CN.md`.
 
 - `index.ts`: extension entrypoint; registers Pi commands and hooks all Pi lifecycle events.
 - `src/handlers/agent.ts`: starts and finishes the root Langfuse agent observation and trace IO.
+- `src/handlers/system-state.ts`: snapshots transcript-aware prompt/tool state and emits bounded state-change events.
+- `src/handlers/cache.ts`: records cache-warming decisions and persisted cache-warm usage.
+- `src/handlers/session.ts`: records structured compaction metadata and summary usage.
 - `src/handlers/generation.ts`: tracks provider requests, response metadata, TTFT, and generation completion.
 - `src/handlers/tool.ts`: tracks tool observations, correlates them by `toolCallId`, and records tool error scores.
 - `src/handlers/turn.ts`: creates turn-level span wrappers so generations and tools can nest under a turn.
@@ -30,7 +33,9 @@ feature documentation, prefer `README.md` and `README_CN.md`.
 
 The extension maps Pi events onto one Langfuse trace tree:
 
-- One Pi agent run becomes one `pi-agent` trace with a root `agent` observation.
+- One user prompt becomes one `pi-agent` trace with a root `agent` observation.
+- Low-level Pi runs and automatic retries become `agent-attempt` spans inside that trace.
+- Effective prompt/tool state becomes a `system-state` event and is referenced from generations by fingerprint.
 - Provider requests become `llm-generation` observations.
 - Tool calls become `tool` observations.
 - Turns become `span` observations that can parent generations and tool calls.
@@ -39,17 +44,19 @@ The extension maps Pi events onto one Langfuse trace tree:
 The main event flow is:
 
 1. `session_start`: ensure config and reset run state for the session.
-2. `before_agent_start` / `agent_start`: create the root agent observation if missing.
-3. `turn_start`: open a turn span.
-4. `before_provider_request`: start a generation.
-5. `after_provider_response`: attach provider metadata and early error status.
-6. `message_update`: record TTFT and capture the latest assistant output.
-7. `message_end`: finalize the active generation.
-8. `tool_execution_start` / `tool_call`: start a tool observation.
-9. `tool_result` / `tool_execution_end`: finalize the matching tool observation.
-10. `turn_end`: close the turn and synthesize a fallback generation if Pi skipped normal generation events.
-11. `agent_end`: close the root observation, update trace IO, and send aggregate scores.
-12. `session_shutdown`: close dangling observations and flush Langfuse runtime state.
+2. `before_agent_start`: create the root agent observation if missing.
+3. `agent_start`: open an attempt span and record effective prompt/tool state.
+4. `turn_start`: open a turn span.
+5. `before_provider_request`: start a generation linked to the current prompt/tool state.
+6. `after_provider_response`: attach provider metadata and early error status.
+7. `message_update`: record TTFT and capture the latest assistant output.
+8. `message_end`: finalize the active generation and cache-efficiency metadata.
+9. `tool_execution_start` / `tool_call`: start a tool observation.
+10. `tool_result` / `tool_execution_end`: finalize the matching tool observation.
+11. `turn_end`: close the turn and synthesize a fallback generation if Pi skipped normal generation events.
+12. `agent_end`: close only the current attempt.
+13. `agent_settled`: close the root observation, update trace IO, and send aggregate scores.
+14. `session_shutdown`: close dangling observations and flush Langfuse runtime state.
 
 ## Working Rules
 
@@ -57,6 +64,8 @@ The main event flow is:
   counters or active observations across Pi sessions.
 - Preserve idempotency around lifecycle hooks. `before_agent_start` and `agent_start`, and similarly
   tool/generation start-end pairs, may both fire; handlers are written to tolerate duplicate entry points.
+- Preserve transcript state continuity. Session-level prompt/tool fingerprints and seen transcript entry IDs
+  intentionally survive per-run resets so resumed runs report deltas instead of replaying old history.
 - Keep tool correlation keyed by `toolCallId`. This is important for concurrent tool execution.
 - Maintain defensive payload shaping. Large objects, circular references, deep trees, and JSON-like strings
   are intentionally normalized before being sent to Langfuse.

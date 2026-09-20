@@ -89,6 +89,8 @@ pi-langfuse/
 
 - 一个用户提示词对应一个 `pi-agent` trace。
 - 根 `agent` 观察节点与 trace 的输入、输出保持同步。
+- 每次底层 Pi agent 执行对应一个 `agent-attempt` span，使自动重试保留在同一 trace 中。
+- transcript-aware prompt/tool 快照和增量对应 `system-state` event。
 - 每次提供商请求对应一个 `generation` 观察节点。
 - 每次工具调用对应一个 `tool` 观察节点。
 - 每个助手 turn 可选创建一个 `span`，用于挂载该轮中的 generation 和 tool。
@@ -100,17 +102,19 @@ pi-langfuse/
 主要生命周期如下：
 
 1. `session_start`：加载配置并重置会话状态。
-2. `before_agent_start` / `agent_start`：创建根 agent 观察节点。
-3. `turn_start`：打开 turn span。
-4. `before_provider_request`：开始记录 generation。
-5. `after_provider_response`：补充提供商元数据和早期错误状态。
-6. `message_update`：记录首字节时间和最新助手输出。
-7. `message_end`：结束当前 generation。
-8. `tool_execution_start` / `tool_call`：开始记录工具观察节点。
-9. `tool_result` / `tool_execution_end`：结束匹配的工具观察节点。
-10. `turn_end`：结束 turn；如果常规 generation 事件缺失，则补一个兜底 generation。
-11. `agent_end`：结束根观察节点、同步 trace I/O，并发送分数。
-12. `session_shutdown`：结束悬空观察节点并 flush 待发送遥测数据。
+2. `before_agent_start`：创建根 agent 观察节点。
+3. `agent_start`：打开 attempt span，并记录有效 system/tool 状态。
+4. `turn_start`：打开 turn span。
+5. `before_provider_request`：开始记录 generation，并关联当前 system/tool 状态。
+6. `after_provider_response`：补充提供商元数据和早期错误状态。
+7. `message_update`：记录首字节时间和最新助手输出。
+8. `message_end`：结束当前 generation，并补充缓存效率元数据。
+9. `tool_execution_start` / `tool_call`：开始记录工具观察节点。
+10. `tool_result` / `tool_execution_end`：结束匹配的工具观察节点。
+11. `turn_end`：结束 turn；如果常规 generation 事件缺失，则补一个兜底 generation。
+12. `agent_end`：只结束当前 attempt。
+13. `agent_settled`：结束根观察节点、同步 trace I/O，并发送分数。
+14. `session_shutdown`：结束悬空观察节点并 flush 待发送遥测数据。
 
 ## 追踪模型
 
@@ -120,17 +124,19 @@ Trace (name: "pi-agent")
 ├── input:  用户提示词，存在时包含图片或上下文摘要
 ├── output: 最终助手响应
 └── Agent observation (name: "pi-agent", type: agent)
-    ├── input:  当前用户提示词
-    ├── output: 最终助手响应
-    ├── Generation observation (name: "llm-generation", type: generation)
-    │   ├── input: 提供商请求负载或消息历史
-    │   ├── output: 已定型的助手消息或工具调用消息
-    │   ├── model, usageDetails, costDetails
-    │   └── metadata: 提供商或请求细节
-    └── Tool observation (name: "<tool-name>", type: tool)
-        ├── input: 工具参数
-        ├── output: 工具结果
-        └── metadata: toolCallId, isError
+    ├── System-state observation (name: "system-state", type: event)
+    ├── Attempt observation (name: "agent-attempt", type: span)
+    │   ├── Generation observation (name: "llm-generation", type: generation)
+    │   │   ├── input: 提供商请求负载或消息历史
+    │   │   ├── output: 已定型的助手消息或工具调用消息
+    │   │   ├── model, usageDetails, costDetails
+    │   │   └── metadata: 提供商、请求和 system/tool 状态细节
+    │   └── Tool observation (name: "<tool-name>", type: tool)
+    │       ├── input: 工具参数
+    │       ├── output: 工具结果
+    │       └── metadata: toolCallId, isError
+    └── Session-compaction observation (name: "session-compaction", type: span)
+        └── Compaction-summary observation (name: "compaction-summary", type: generation)
 ```
 
 ## 追踪字段
@@ -187,6 +193,10 @@ Trace (name: "pi-agent")
 | `metadata.provider` | 提供商名称 |
 | `metadata.requestId` | 可用时的提供商或 Pi 请求标识符 |
 | `metadata.status` | 可用时的 HTTP 或提供商状态 |
+| `metadata.promptStateHash` | 有效渲染 system prompt 的指纹 |
+| `metadata.toolStateHash` | 活动工具名称集合的指纹 |
+| `metadata.toolUpdateTransport` | 在提供商请求负载中观察到的动态工具协议 |
+| `metadata.cacheHitRatio` | cache read token 占可缓存输入 token 的比例 |
 
 ### Tool 观察节点
 

@@ -12,6 +12,8 @@ import {
   extractCostDetails,
   getCapturePolicy,
   extractModelParameters,
+  extractCacheMetrics,
+  inferToolUpdateTransport,
 } from "../utils.js";
 import type { GenerationState, ObservationUpdate } from "../types.js";
 import { applyCapturePolicy } from "../capture-policy.js";
@@ -43,11 +45,26 @@ export async function startGeneration(event: Record<string, unknown>) {
     const modelParameters = extractModelParameters(payload);
     const model = String(event.model ?? event.modelId ?? state.currentModel ?? "");
     const provider = String(event.provider ?? state.currentProvider ?? "");
+    const toolUpdateTransport = inferToolUpdateTransport(payload, (state.agentState.systemStateSequence ?? 0) > 1);
     const metadata = shapePayload({
       provider,
       requestId: key,
       url: event.url,
       method: event.method,
+      promptStateHash: state.agentState.promptStateHash,
+      toolStateHash: state.agentState.toolStateHash,
+      systemStateSequence: state.agentState.systemStateSequence,
+      activeToolCount: state.agentState.activeToolCount,
+      toolUpdateTransport,
+      cachePreservationExpected:
+        toolUpdateTransport === "anthropic-native" ||
+        toolUpdateTransport === "openai-additional-tools" ||
+        toolUpdateTransport === "openai-tool-search" ||
+        toolUpdateTransport === "mid-conversation-system"
+          ? true
+          : toolUpdateTransport === "collapsed-leading-system"
+            ? false
+            : undefined,
     }) as Record<string, unknown>;
     const captured = applyCapturePolicy(
       {
@@ -57,7 +74,7 @@ export async function startGeneration(event: Record<string, unknown>) {
       getCapturePolicy(),
     );
 
-    const parent = state.agentState.activeTurn ?? state.agentState.root;
+    const parent = state.agentState.activeTurn ?? state.agentState.activeAttempt ?? state.agentState.root;
     const generation = await startChildObservation({
       parent,
       runtime: getRuntime,
@@ -177,6 +194,7 @@ export async function finishGenerationFromMessage(event: Record<string, unknown>
 
   const usageDetails = extractUsage({ ...event, message });
   const costDetails = extractCostDetails({ ...event, message });
+  const cacheMetrics = extractCacheMetrics({ ...event, message });
   const modelParameters = extractModelParameters(getProviderPayload(event)) ?? generation.modelParameters;
   const model = String(message.model ?? event.model ?? state.currentModel ?? "");
   const update: ObservationUpdate = {
@@ -188,6 +206,7 @@ export async function finishGenerationFromMessage(event: Record<string, unknown>
     metadata: {
       ...generation.metadata,
       finishReason: message.finishReason ?? message.stopReason ?? event.finishReason,
+      ...cacheMetrics,
     },
   };
   update.metadata = applyCapturePolicy({ metadata: update.metadata }, getCapturePolicy()).metadata;
@@ -195,6 +214,12 @@ export async function finishGenerationFromMessage(event: Record<string, unknown>
   try {
     generation.observation.update(update).end();
     generation.ended = true;
+    if (cacheMetrics) {
+      state.agentState.cacheReadTokens = (state.agentState.cacheReadTokens ?? 0) + cacheMetrics.cacheReadTokens;
+      state.agentState.cacheWriteTokens = (state.agentState.cacheWriteTokens ?? 0) + cacheMetrics.cacheWriteTokens;
+      state.agentState.uncachedInputTokens =
+        (state.agentState.uncachedInputTokens ?? 0) + cacheMetrics.uncachedInputTokens;
+    }
   } catch (e) {
     console.warn("📊 Langfuse: Failed to finish generation", e);
   }
@@ -208,6 +233,7 @@ export async function createFallbackGenerationFromTurn(event: Record<string, unk
   try {
     const usageDetails = extractUsage({ ...event, message });
     const costDetails = extractCostDetails({ ...event, message });
+    const cacheMetrics = extractCacheMetrics({ ...event, message });
     const modelParameters = extractModelParameters(getProviderPayload(event));
     const model = String(message.model ?? event.model ?? state.currentModel ?? "");
     const captured = applyCapturePolicy(
@@ -217,11 +243,16 @@ export async function createFallbackGenerationFromTurn(event: Record<string, unk
         metadata: {
           provider: state.currentProvider || undefined,
           sourceEvent: "turn_end",
+          promptStateHash: state.agentState.promptStateHash,
+          toolStateHash: state.agentState.toolStateHash,
+          systemStateSequence: state.agentState.systemStateSequence,
+          activeToolCount: state.agentState.activeToolCount,
+          ...cacheMetrics,
         },
       },
       getCapturePolicy(),
     );
-    const parent = state.agentState.activeTurn ?? state.agentState.root;
+    const parent = state.agentState.activeTurn ?? state.agentState.activeAttempt ?? state.agentState.root;
     const generation = await startChildObservation({
       parent,
       runtime: getRuntime,
@@ -240,6 +271,12 @@ export async function createFallbackGenerationFromTurn(event: Record<string, unk
 
     generation.end();
     state.agentState.generationOrder.push("turn-end-fallback");
+    if (cacheMetrics) {
+      state.agentState.cacheReadTokens = (state.agentState.cacheReadTokens ?? 0) + cacheMetrics.cacheReadTokens;
+      state.agentState.cacheWriteTokens = (state.agentState.cacheWriteTokens ?? 0) + cacheMetrics.cacheWriteTokens;
+      state.agentState.uncachedInputTokens =
+        (state.agentState.uncachedInputTokens ?? 0) + cacheMetrics.uncachedInputTokens;
+    }
   } catch (e) {
     console.warn("📊 Langfuse: Failed to create fallback generation", e);
   }

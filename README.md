@@ -269,6 +269,12 @@ This command makes a timeout-bounded authenticated request to Langfuse and, if i
 - Tool runs appear as tool observations with arguments, results, and error state.
 - LLM requests appear as generation observations, including usage and cost when the provider exposes them.
   Reasoning tokens are reported as their own usage bucket when `PI_LANGFUSE_SPLIT_REASONING_TOKENS` is enabled.
+- Pi 0.86 transcript-aware prompt/tool state appears as `system-state` events. Generations reference the
+  effective prompt/tool state hashes, active tool count, update transport, and cache hit ratio.
+- Automatic retries are grouped under `agent-attempt` spans and the trace remains open until `agent_settled`.
+- Cache-warming decisions and persisted `cache_warm` usage are reported, including standalone session-grouped
+  traces when warming happens while no user-request trace is active.
+- Compaction is recorded as `session-compaction`, with a nested `compaction-summary` generation when usage is available.
 - Trace-level scores include tool counts, tool success rate, and whether the run had errors.
 
 The package also includes a Langfuse CLI skill, so Langfuse data can be queried directly from Pi:

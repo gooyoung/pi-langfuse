@@ -14,10 +14,23 @@ import { state, resetRunState, runWithSession, setCurrentSession } from "./src/s
 import { ensureConfig, promptForConfig, loadConfig } from "./src/config.js";
 import { shutdownRuntime } from "./src/langfuse.js";
 import { handleLangfusePrivacyCommand, handleLangfuseStatusCommand, handleLangfuseTestCommand } from "./src/commands.js";
-import { getMessageFromEvent, extractAssistantOutput, getCapturePolicy } from "./src/utils.js";
-import { applyCapturePolicy } from "./src/capture-policy.js";
-import { startAgentRun, finishAgentRun, recordSystemPrompt } from "./src/handlers/agent.js";
+import { getMessageFromEvent, extractAssistantOutput } from "./src/utils.js";
+import {
+  startAgentRun,
+  finishAgentRun,
+  finishAgentAttempt,
+  cancelAgentRun,
+  recordSystemPrompt,
+  startAgentAttempt,
+} from "./src/handlers/agent.js";
 import { startTurnObservation, finishTurnObservation } from "./src/handlers/turn.js";
+import { initializeSystemStateTracking, recordSystemState } from "./src/handlers/system-state.js";
+import {
+  initializeUsageTracking,
+  recordCacheWarmingDecision,
+  recordNewUsageEntries,
+} from "./src/handlers/cache.js";
+import { recordSessionCompaction } from "./src/handlers/session.js";
 import {
   startGeneration,
   updateGenerationMetadata,
@@ -28,7 +41,6 @@ import {
 import {
   startToolObservation,
   finishToolObservation,
-  closeDanglingObservations,
 } from "./src/handlers/tool.js";
 
 // ============================================
@@ -36,6 +48,7 @@ import {
 // ============================================
 
 export default async function (pi: ExtensionAPI) {
+  const asRecord = (value: object): Record<string, unknown> => value as unknown as Record<string, unknown>;
   if (!state.config) {
     state.config = loadConfig();
   }
@@ -97,6 +110,8 @@ export default async function (pi: ExtensionAPI) {
     state.setupAttemptedThisSession = false;
     await ensureConfig(ctx);
     resetRunState();
+    initializeSystemStateTracking(ctx);
+    initializeUsageTracking(ctx);
   }));
 
   pi.on("model_select", async (event, ctx) => withSession(ctx, async () => {
@@ -105,84 +120,87 @@ export default async function (pi: ExtensionAPI) {
   }));
 
   pi.on("before_agent_start", async (event, ctx) => withSession(ctx, async () => {
-    await startAgentRun(event, ctx);
+    await recordNewUsageEntries(ctx);
+    await startAgentRun(asRecord(event), ctx);
   }));
 
   pi.on("agent_start", async (event, ctx) => withSession(ctx, async () => {
     if (!state.agentState?.root) {
-      await startAgentRun(event, ctx);
+      await startAgentRun(asRecord(event), ctx);
     }
+    await startAgentAttempt();
     // The system prompt is only final here: before_agent_start handlers that
     // run after this extension may still rewrite it.
     await recordSystemPrompt(ctx);
+    await recordSystemState(ctx, pi.getActiveTools());
+  }));
+
+  pi.on("cache_warming_decision", async (event, ctx) => withSession(ctx, async () => {
+    await recordNewUsageEntries(ctx);
+    await recordCacheWarmingDecision(asRecord(event), ctx);
   }));
 
   pi.on("turn_start", async (event, ctx) => withSession(ctx, async () => {
-    await startTurnObservation(event);
+    await startTurnObservation(asRecord(event));
   }));
 
   pi.on("before_provider_request", async (event, ctx) => withSession(ctx, async () => {
-    await startGeneration(event);
+    await startGeneration(asRecord(event));
   }));
 
   pi.on("after_provider_response", async (event, ctx) => withSession(ctx, async () => {
-    updateGenerationMetadata(event);
+    updateGenerationMetadata(asRecord(event));
   }));
 
   pi.on("message_update", async (event, ctx) => withSession(ctx, async () => {
-    recordTTFT(event);
-    const message = getMessageFromEvent(event);
+    recordTTFT(asRecord(event));
+    const message = getMessageFromEvent(asRecord(event));
     if (message?.role === "assistant" && state.agentState) {
       state.agentState.latestAssistantOutput = extractAssistantOutput(message);
     }
   }));
 
   pi.on("message_end", async (event, ctx) => withSession(ctx, async () => {
-    await finishGenerationFromMessage(event);
+    await finishGenerationFromMessage(asRecord(event));
   }));
 
   pi.on("tool_execution_start", async (event, ctx) => withSession(ctx, async () => {
-    await startToolObservation(event);
+    await startToolObservation(asRecord(event));
   }));
 
   pi.on("tool_call", async (event, ctx) => withSession(ctx, async () => {
-    await startToolObservation(event);
+    await startToolObservation(asRecord(event));
   }));
 
   pi.on("tool_result", async (event, ctx) => withSession(ctx, async () => {
-    await finishToolObservation(event);
+    await finishToolObservation(asRecord(event));
   }));
 
   pi.on("tool_execution_end", async (event, ctx) => withSession(ctx, async () => {
-    await finishToolObservation(event);
+    await finishToolObservation(asRecord(event));
   }));
 
   pi.on("turn_end", async (event, ctx) => withSession(ctx, async () => {
     state.turnCount++;
-    const message = getMessageFromEvent(event);
+    const record = asRecord(event);
+    const message = getMessageFromEvent(record);
     if (message?.role === "assistant") {
-      await createFallbackGenerationFromTurn(event, message);
-      await finishGenerationFromMessage(event);
+      await createFallbackGenerationFromTurn(record, message);
+      await finishGenerationFromMessage(record);
     }
-    finishTurnObservation(event);
+    finishTurnObservation(record);
   }));
 
   pi.on("agent_end", async (event, ctx) => withSession(ctx, async () => {
-    await finishAgentRun(event);
-    const sessionId = state.currentSessionId;
-    try {
-      await shutdownRuntime(sessionId);
-    } catch (error) {
-      console.warn("📊 Langfuse: Shutdown failed", error);
-    }
+    finishAgentAttempt(asRecord(event));
+  }));
+
+  pi.on("agent_settled", async (_event, ctx) => withSession(ctx, async () => {
+    await finishAgentRun();
   }));
 
   const handleSessionInterruption = (reason: string) => {
-    if (state.agentState?.root) {
-      closeDanglingObservations(reason);
-      state.agentState.root.update({ metadata: { completed: false, cancelled: true } }).end();
-    }
-    resetRunState();
+    cancelAgentRun(reason);
   };
 
   pi.on("session_before_switch", async (_event, ctx) => {
@@ -200,26 +218,11 @@ export default async function (pi: ExtensionAPI) {
   });
 
   pi.on("session_compact", async (event, ctx) => withSession(ctx, async () => {
-    if (state.agentState?.root) {
-      const parent = state.agentState.activeTurn ?? state.agentState.root;
-      try {
-        const observation = parent.startObservation ? parent.startObservation(
-          "session_compact", 
-          {
-            level: "DEFAULT",
-            statusMessage: "Context was compacted",
-            metadata: applyCapturePolicy({ metadata: { ...event } }, getCapturePolicy()).metadata
-          }, 
-          { asType: "span" }
-        ) : undefined;
-        observation?.end();
-      } catch (e) {
-        // ignore
-      }
-    }
+    await recordSessionCompaction(asRecord(event));
   }));
 
   pi.on("session_shutdown", async (_event, ctx) => withSession(ctx, async () => {
+    await recordNewUsageEntries(ctx);
     handleSessionInterruption("Session shutdown before agent completed");
     await shutdownRuntime();
   }));

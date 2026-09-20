@@ -334,6 +334,55 @@ export function getProviderPayload(event: Record<string, unknown>): unknown {
   return event.request ?? event.payload ?? event.body ?? event.providerPayload ?? event.messages ?? event;
 }
 
+export type ToolUpdateTransport =
+  | "anthropic-native"
+  | "openai-additional-tools"
+  | "openai-tool-search"
+  | "mid-conversation-system"
+  | "collapsed-leading-system";
+
+/** Classify the provider payload observed by this hook rather than guessing from the model name alone. */
+export function inferToolUpdateTransport(payload: unknown, hasPriorSystemState: boolean): ToolUpdateTransport | undefined {
+  let sawToolChangeBlock = false;
+  let sawAdditionalTools = false;
+  let sawToolSearch = false;
+  let sawTopLevelTools = false;
+  let sawMidConversationSystem = false;
+  let visited = 0;
+
+  const walk = (value: unknown, key?: string) => {
+    if (++visited > 2_000 || value === null || value === undefined) return;
+    if (key === "additional_tools") sawAdditionalTools = true;
+    if (key === "tools") sawTopLevelTools = true;
+    if (key === "tool_search" || key === "tool_search_output") sawToolSearch = true;
+    if (typeof value !== "object") return;
+    if (Array.isArray(value)) {
+      let sawNonSystem = false;
+      for (const item of value) {
+        if (item && typeof item === "object" && !Array.isArray(item)) {
+          const role = (item as Record<string, unknown>).role;
+          if (role === "system" && sawNonSystem) sawMidConversationSystem = true;
+          if (role && role !== "system") sawNonSystem = true;
+        }
+        walk(item);
+      }
+      return;
+    }
+    const record = value as Record<string, unknown>;
+    const type = record.type;
+    if (type === "tool_addition" || type === "tool_removal") sawToolChangeBlock = true;
+    for (const [childKey, child] of Object.entries(record)) walk(child, childKey);
+  };
+
+  walk(payload);
+  if (sawToolChangeBlock) return "anthropic-native";
+  if (sawAdditionalTools) return "openai-additional-tools";
+  if (sawToolSearch) return "openai-tool-search";
+  if (sawMidConversationSystem) return "mid-conversation-system";
+  if (hasPriorSystemState && sawTopLevelTools) return "collapsed-leading-system";
+  return undefined;
+}
+
 export function extractModelParameters(payload: unknown): Record<string, string | number> | undefined {
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
     return undefined;
@@ -484,6 +533,32 @@ export function extractUsage(
     total,
     ...(cacheRead ? { [CACHE_READ_KEY]: cacheRead } : {}),
     ...splitCacheWrite(cacheWrite, cacheWrite1h),
+  };
+}
+
+export function extractCacheMetrics(messageOrEvent: Record<string, unknown>): {
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  uncachedInputTokens: number;
+  cacheHitRatio?: number;
+} | undefined {
+  const usage = (messageOrEvent.usage ??
+    (messageOrEvent.message && typeof messageOrEvent.message === "object"
+      ? (messageOrEvent.message as Record<string, unknown>).usage
+      : undefined)) as Record<string, unknown> | undefined;
+  if (!usage || typeof usage !== "object") return undefined;
+
+  const uncachedInputTokens = Number(
+    usage.input ?? usage.inputTokens ?? usage.prompt_tokens ?? usage.promptTokens ?? 0,
+  );
+  const cacheReadTokens = Number(usage.cacheRead ?? usage.cache_read ?? usage.cachedTokens ?? 0);
+  const cacheWriteTokens = Number(usage.cacheWrite ?? usage.cache_write ?? 0);
+  const denominator = uncachedInputTokens + cacheReadTokens;
+  return {
+    cacheReadTokens,
+    cacheWriteTokens,
+    uncachedInputTokens,
+    ...(denominator > 0 ? { cacheHitRatio: cacheReadTokens / denominator } : {}),
   };
 }
 

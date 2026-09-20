@@ -89,6 +89,8 @@ The extension maps one Pi agent run to one Langfuse trace tree:
 
 - One user prompt becomes one `pi-agent` trace.
 - A root `agent` observation mirrors the trace input and output.
+- Each low-level Pi agent execution becomes an `agent-attempt` span so automatic retries stay in the same trace.
+- Transcript-aware prompt/tool snapshots and deltas become `system-state` events.
 - Each provider request becomes a `generation` observation.
 - Each tool call becomes a `tool` observation.
 - Each assistant turn can open a `span` so generations and tools nest under the turn.
@@ -100,17 +102,19 @@ State is session-scoped. The runtime uses `AsyncLocalStorage` to prevent overlap
 The main lifecycle is:
 
 1. `session_start`: load config and reset session state.
-2. `before_agent_start` / `agent_start`: create the root agent observation.
-3. `turn_start`: open a turn span.
-4. `before_provider_request`: start a generation.
-5. `after_provider_response`: attach provider metadata and early error status.
-6. `message_update`: record TTFT and the latest assistant output.
-7. `message_end`: finalize the active generation.
-8. `tool_execution_start` / `tool_call`: start a tool observation.
-9. `tool_result` / `tool_execution_end`: finalize the matching tool observation.
-10. `turn_end`: close the turn and synthesize a fallback generation if needed.
-11. `agent_end`: close the root observation, mirror trace I/O, and send scores.
-12. `session_shutdown`: close dangling observations and flush pending telemetry.
+2. `before_agent_start`: create the root agent observation.
+3. `agent_start`: open an attempt span and record the effective system/tool state.
+4. `turn_start`: open a turn span.
+5. `before_provider_request`: start a generation and link it to the current system/tool state.
+6. `after_provider_response`: attach provider metadata and early error status.
+7. `message_update`: record TTFT and the latest assistant output.
+8. `message_end`: finalize the active generation and cache-efficiency metadata.
+9. `tool_execution_start` / `tool_call`: start a tool observation.
+10. `tool_result` / `tool_execution_end`: finalize the matching tool observation.
+11. `turn_end`: close the turn and synthesize a fallback generation if needed.
+12. `agent_end`: close only the current attempt.
+13. `agent_settled`: close the root observation, mirror trace I/O, and send scores.
+14. `session_shutdown`: close dangling observations and flush pending telemetry.
 
 ## Trace Model
 
@@ -120,17 +124,19 @@ Trace (name: "pi-agent")
 ├── input:  user prompt, images/context summary when present
 ├── output: final assistant response
 └── Agent observation (name: "pi-agent", type: agent)
-    ├── input:  current user prompt
-    ├── output: final assistant response
-    ├── Generation observation (name: "llm-generation", type: generation)
-    │   ├── input: provider request payload / message history
-    │   ├── output: finalized assistant message or tool-call message
-    │   ├── model, usageDetails, costDetails
-    │   └── metadata: provider/request details
-    └── Tool observation (name: "<tool-name>", type: tool)
-        ├── input: tool parameters
-        ├── output: tool result
-        └── metadata: toolCallId, isError
+    ├── System-state observation (name: "system-state", type: event)
+    ├── Attempt observation (name: "agent-attempt", type: span)
+    │   ├── Generation observation (name: "llm-generation", type: generation)
+    │   │   ├── input: provider request payload / message history
+    │   │   ├── output: finalized assistant message or tool-call message
+    │   │   ├── model, usageDetails, costDetails
+    │   │   └── metadata: provider/request and system/tool state details
+    │   └── Tool observation (name: "<tool-name>", type: tool)
+    │       ├── input: tool parameters
+    │       ├── output: tool result
+    │       └── metadata: toolCallId, isError
+    └── Session-compaction observation (name: "session-compaction", type: span)
+        └── Compaction-summary observation (name: "compaction-summary", type: generation)
 ```
 
 ## What Gets Tracked
@@ -187,6 +193,10 @@ Trace (name: "pi-agent")
 | `metadata.provider` | Provider name |
 | `metadata.requestId` | Provider or Pi request identifier when available |
 | `metadata.status` | HTTP or provider status when available |
+| `metadata.promptStateHash` | Fingerprint of the effective rendered system prompt |
+| `metadata.toolStateHash` | Fingerprint of the active tool-name set |
+| `metadata.toolUpdateTransport` | Dynamic-tool protocol observed in the provider payload |
+| `metadata.cacheHitRatio` | Cache-read share of cacheable input tokens |
 
 ### Tool Observations
 

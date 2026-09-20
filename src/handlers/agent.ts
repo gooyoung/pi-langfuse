@@ -5,6 +5,7 @@ import { shapePayload, truncate, extractFinalAssistant, extractAssistantOutput, 
 import { closeDanglingObservations } from "./tool.js";
 import { applyCapturePolicy } from "../capture-policy.js";
 import { collectSourceMetadata } from "../source-metadata.js";
+import { startChildObservation } from "../observation.js";
 
 function stringMetadata(metadata: Record<string, unknown> | undefined): Record<string, string> | undefined {
   if (!metadata) {
@@ -70,6 +71,7 @@ export async function startAgentRun(event: Record<string, unknown>, ctx: any) {
           ...(state.currentModel ? { model: state.currentModel } : {}),
           ...(state.currentProvider ? { provider: state.currentProvider } : {}),
           sessionId: state.currentSessionId || undefined,
+          sessionLeafId: ctx?.sessionManager?.getLeafId?.() || undefined,
         },
       },
       capturePolicy,
@@ -84,6 +86,11 @@ export async function startAgentRun(event: Record<string, unknown>, ctx: any) {
       activeTools: new Map(),
       sourceMetadata,
       providerMetadataByRequest: new Map(),
+      attemptCount: 0,
+      systemStateChangeCount: 0,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      uncachedInputTokens: 0,
     };
 
     const root = rt.propagateAttributes(
@@ -110,6 +117,82 @@ export async function startAgentRun(event: Record<string, unknown>, ctx: any) {
     console.warn("📊 Langfuse: Failed to create agent observation", e);
     state.isTracingDisabled = true;
   }
+}
+
+export async function startAgentAttempt() {
+  const agent = state.agentState;
+  if (state.isTracingDisabled || !agent?.root) return;
+
+  if (agent.activeAttempt) {
+    agent.activeAttempt
+      .update({ level: "WARNING", statusMessage: "A new agent attempt started before the previous attempt ended" })
+      .end();
+  }
+
+  try {
+    agent.attemptCount++;
+    agent.activeAttempt = await startChildObservation({
+      parent: agent.root,
+      runtime: getRuntime,
+      name: "agent-attempt",
+      body: { metadata: { attemptIndex: agent.attemptCount } },
+      asType: "span",
+    });
+  } catch (error) {
+    console.warn("📊 Langfuse: Failed to start agent attempt", error);
+  }
+}
+
+export function finishAgentAttempt(event: Record<string, unknown> = {}) {
+  const agent = state.agentState;
+  if (!agent) return;
+  agent.lastAgentEndEvent = event;
+
+  closeDanglingObservations("Agent attempt ended before observation finalized");
+  if (agent.activeTurn) {
+    agent.activeTurn
+      .update({ level: "WARNING", statusMessage: "Agent attempt ended before turn finalized" })
+      .end();
+    agent.activeTurn = undefined;
+  }
+
+  if (!agent.activeAttempt) return;
+  try {
+    const lastAssistant = extractFinalAssistant(event.messages);
+    const captured = applyCapturePolicy(
+      { output: lastAssistant ? extractAssistantOutput(lastAssistant) : undefined },
+      getCapturePolicy(),
+    );
+    agent.activeAttempt.update({ output: captured.output }).end();
+  } catch (error) {
+    console.warn("📊 Langfuse: Failed to finish agent attempt", error);
+  } finally {
+    agent.activeAttempt = undefined;
+  }
+}
+
+export function cancelAgentRun(reason: string) {
+  const agent = state.agentState;
+  if (!agent?.root) {
+    resetRunState();
+    return;
+  }
+
+  closeDanglingObservations(reason);
+  if (agent.activeTurn) {
+    agent.activeTurn.update({ level: "WARNING", statusMessage: reason, metadata: { cancelled: true } }).end();
+    agent.activeTurn = undefined;
+  }
+  if (agent.activeAttempt) {
+    agent.activeAttempt.update({ level: "WARNING", statusMessage: reason, metadata: { cancelled: true } }).end();
+    agent.activeAttempt = undefined;
+  }
+  agent.root.update({
+    level: "WARNING",
+    statusMessage: reason,
+    metadata: { completed: false, cancelled: true },
+  }).end();
+  resetRunState();
 }
 
 /**
@@ -161,7 +244,8 @@ export async function finishAgentRun(event: Record<string, unknown> = {}) {
     return;
   }
 
-  const lastAssistant = extractFinalAssistant(event.messages);
+  const finalEvent = Object.keys(event).length > 0 ? event : state.agentState.lastAgentEndEvent ?? {};
+  const lastAssistant = extractFinalAssistant(finalEvent.messages);
   const rawOutput = lastAssistant ? extractAssistantOutput(lastAssistant) : state.agentState.latestAssistantOutput;
   const captured = applyCapturePolicy(
     {
@@ -173,6 +257,19 @@ export async function finishAgentRun(event: Record<string, unknown> = {}) {
         model: state.currentModel || undefined,
         provider: state.currentProvider || undefined,
         totalTools: state.toolCallCount,
+        agentAttemptCount: state.agentState.attemptCount,
+        systemStateChangeCount: state.agentState.systemStateChangeCount,
+        promptStateHash: state.agentState.promptStateHash,
+        toolStateHash: state.agentState.toolStateHash,
+        activeToolCount: state.agentState.activeToolCount,
+        cacheReadTokens: state.agentState.cacheReadTokens,
+        cacheWriteTokens: state.agentState.cacheWriteTokens,
+        uncachedInputTokens: state.agentState.uncachedInputTokens,
+        cacheHitRatio:
+          state.agentState.cacheReadTokens + state.agentState.uncachedInputTokens > 0
+            ? state.agentState.cacheReadTokens /
+              (state.agentState.cacheReadTokens + state.agentState.uncachedInputTokens)
+            : undefined,
         ...computeEvaluationScores(),
       },
     },
@@ -181,6 +278,10 @@ export async function finishAgentRun(event: Record<string, unknown> = {}) {
   const scores = computeEvaluationScores();
 
   closeDanglingObservations("Agent run ended before observation finalized");
+  if (state.agentState.activeAttempt) {
+    state.agentState.activeAttempt.end();
+    state.agentState.activeAttempt = undefined;
+  }
 
   try {
     state.agentState.root

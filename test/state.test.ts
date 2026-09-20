@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import {
   clearAllSessionStates,
   computeEvaluationScores,
+  getSessionRunState,
   resetRunState,
   setCurrentSession,
   state,
@@ -92,11 +93,18 @@ test("preserves setup attempt guard when resetting run state", () => {
   setCurrentSession("session-a");
   state.setupAttemptedThisSession = true;
   state.toolCallCount = 2;
+  const before = getSessionRunState();
+  before.lastPromptStateHash = "sha256:prompt";
+  before.systemStateSequence = 3;
+  before.seenSystemEntryIds.add("system-entry");
 
   resetRunState();
 
   assert.equal(state.toolCallCount, 0);
   assert.equal(state.setupAttemptedThisSession, true);
+  assert.equal(getSessionRunState().lastPromptStateHash, "sha256:prompt");
+  assert.equal(getSessionRunState().systemStateSequence, 3);
+  assert.equal(getSessionRunState().seenSystemEntryIds.has("system-entry"), true);
 });
 
 function delay(ms: number) {

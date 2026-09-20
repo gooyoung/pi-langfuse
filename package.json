@@ -16,7 +16,6 @@
 	"files": [
 		"index.ts",
 		"src/",
-		"types/",
 		"README.md",
 		"README_CN.md",
 		"image.png",
@@ -52,7 +51,7 @@
 		"@opentelemetry/sdk-trace-base": "^2.0.1"
 	},
 	"peerDependencies": {
-		"@earendil-works/pi-coding-agent": "*"
+		"@earendil-works/pi-coding-agent": ">=0.86.0"
 	},
 	"publishConfig": {
 		"access": "public",
@@ -63,6 +62,7 @@
 		"node": ">=22"
 	},
 	"devDependencies": {
+		"@earendil-works/pi-coding-agent": "^0.86.0",
 		"tsx": "^4.19.0",
 		"typescript": "^6.0.3"
 	}

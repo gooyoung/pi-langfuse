@@ -25,7 +25,7 @@ export async function startTurnObservation(event: Record<string, unknown>) {
       getCapturePolicy(),
     );
     const observation = await startChildObservation({
-      parent: state.agentState.root,
+      parent: state.agentState.activeAttempt ?? state.agentState.root,
       runtime: getRuntime,
       name: "turn",
       body: {

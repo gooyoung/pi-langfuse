@@ -10,7 +10,7 @@ import type { LangfuseRuntime } from "../src/types.ts";
 
 type ExtensionHandler = Parameters<ExtensionAPI["on"]>[1];
 
-test("agent_end waits for runtime shutdown", async () => {
+test("session_shutdown waits for runtime shutdown after agent_settled", async () => {
   const handlers = new Map<string, (event: Record<string, unknown>, ctx: unknown) => Promise<void>>();
   let releaseForceFlush!: () => void;
   let forceFlushStarted = false;
@@ -46,11 +46,20 @@ test("agent_end waits for runtime shutdown", async () => {
     } as any);
 
     const agentEnd = handlers.get("agent_end");
+    const agentSettled = handlers.get("agent_settled");
+    const sessionShutdown = handlers.get("session_shutdown");
     assert.ok(agentEnd);
-    let settled = false;
-    const result = agentEnd!({}, {
+    assert.ok(agentSettled);
+    assert.ok(sessionShutdown);
+    const ctx = {
       sessionManager: { getSessionFile: () => "/tmp/pi-agent-session.jsonl" },
-    }).then(() => {
+    };
+    await agentEnd!({}, ctx);
+    await agentSettled!({}, ctx);
+    assert.equal(forceFlushStarted, false);
+
+    let settled = false;
+    const result = sessionShutdown!({}, ctx).then(() => {
       settled = true;
     });
 

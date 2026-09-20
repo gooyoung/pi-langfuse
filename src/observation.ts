@@ -11,7 +11,7 @@ export async function startChildObservation({
   runtime: () => Promise<LangfuseRuntime>;
   name: string;
   body?: ObservationUpdate;
-  asType: "generation" | "tool" | "span";
+  asType: "event" | "generation" | "tool" | "span";
 }): Promise<LangfuseObservation> {
   if (parent.startObservation) {
     return parent.startObservation(name, body, { asType });

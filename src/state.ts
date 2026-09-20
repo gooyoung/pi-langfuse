@@ -10,6 +10,12 @@ export interface SessionRunState {
   turnCount: number;
   tracingDisabled: boolean;
   setupAttemptedThisSession: boolean;
+  lastPromptStateHash?: string;
+  lastToolStateHash?: string;
+  lastActiveTools: string[];
+  systemStateSequence: number;
+  seenSystemEntryIds: Set<string>;
+  seenUsageEntryIds: Set<string>;
 }
 
 const DEFAULT_SESSION_ID = "__pi_langfuse_default_session__";
@@ -27,6 +33,10 @@ function createSessionRunState(): SessionRunState {
     turnCount: 0,
     tracingDisabled: false,
     setupAttemptedThisSession: false,
+    lastActiveTools: [],
+    systemStateSequence: 0,
+    seenSystemEntryIds: new Set(),
+    seenUsageEntryIds: new Set(),
   };
 }
 
@@ -130,11 +140,16 @@ export const state = {
 
 export function resetRunState(sessionId = getActiveSessionId()) {
   const normalizedSessionId = normalizeSessionId(sessionId);
-  const setupAttemptedThisSession =
-    state.sessionStates.get(normalizedSessionId)?.setupAttemptedThisSession ?? false;
+  const previous = state.sessionStates.get(normalizedSessionId);
   state.sessionStates.set(normalizedSessionId, {
     ...createSessionRunState(),
-    setupAttemptedThisSession,
+    setupAttemptedThisSession: previous?.setupAttemptedThisSession ?? false,
+    lastPromptStateHash: previous?.lastPromptStateHash,
+    lastToolStateHash: previous?.lastToolStateHash,
+    lastActiveTools: previous?.lastActiveTools ?? [],
+    systemStateSequence: previous?.systemStateSequence ?? 0,
+    seenSystemEntryIds: previous?.seenSystemEntryIds ?? new Set(),
+    seenUsageEntryIds: previous?.seenUsageEntryIds ?? new Set(),
   });
 }
 

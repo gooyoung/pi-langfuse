@@ -250,6 +250,12 @@ pi list
 - 工具执行会以工具观察节点展示参数、结果和错误状态。
 - 模型请求会以生成观察节点展示；如果提供商暴露相关信息，还会包含用量和成本。
   开启 `PI_LANGFUSE_SPLIT_REASONING_TOKENS` 后，推理 token 会作为独立用量桶上报。
+- Pi 0.86 的 transcript-aware system/tool 状态会作为 `system-state` 事件上报；generation 会引用有效的
+  prompt/tool 状态指纹、活动工具数、更新传输方式和缓存命中率。
+- 自动重试会归入 `agent-attempt` span，trace 会持续到 `agent_settled` 才结束。
+- cache warming 决策及持久化的 `cache_warm` 用量会被记录；若 warming 发生时没有活动的用户请求 trace，
+  会创建按相同 session 分组的独立 trace。
+- compaction 会记录为 `session-compaction`；若存在摘要用量，则包含 `compaction-summary` generation。
 - trace 级别会记录工具调用次数、工具成功率和是否出现错误。
 
 此包还包含一个内置 Langfuse 技能，可直接在 Pi 中查询 Langfuse 数据：

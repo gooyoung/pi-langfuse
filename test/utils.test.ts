@@ -4,11 +4,39 @@ import assert from "node:assert/strict";
 import {
   extractAssistantOutput,
   extractCostDetails,
+  extractCacheMetrics,
   extractUsage,
   extractModelParameters,
+  inferToolUpdateTransport,
   normalizeContentForLangfuse,
   shapePayload,
 } from "../src/utils.ts";
+
+test("inferToolUpdateTransport detects provider-native and collapsed tool updates", () => {
+  assert.equal(
+    inferToolUpdateTransport({ messages: [{ role: "user" }, { type: "tool_addition", name: "write" }] }, true),
+    "anthropic-native",
+  );
+  assert.equal(inferToolUpdateTransport({ additional_tools: [{ name: "write" }] }, true), "openai-additional-tools");
+  assert.equal(
+    inferToolUpdateTransport({ messages: [{ role: "user" }, { role: "system", content: "add write" }] }, true),
+    "mid-conversation-system",
+  );
+  assert.equal(inferToolUpdateTransport({ tools: [{ name: "write" }] }, true), "collapsed-leading-system");
+  assert.equal(inferToolUpdateTransport({ tools: [{ name: "read" }] }, false), undefined);
+});
+
+test("extractCacheMetrics reports Pi's exclusive uncached input and cache hit ratio", () => {
+  assert.deepEqual(
+    extractCacheMetrics({ usage: { input: 20, cacheRead: 80, cacheWrite: 10 } }),
+    {
+      cacheReadTokens: 80,
+      cacheWriteTokens: 10,
+      uncachedInputTokens: 20,
+      cacheHitRatio: 0.8,
+    },
+  );
+});
 
 test("shapePayload aborts when node budget is exceeded", () => {
   const payload = {

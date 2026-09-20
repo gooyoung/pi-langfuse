@@ -37,7 +37,7 @@ export async function startToolObservation(event: Record<string, unknown>) {
       getCapturePolicy(),
     );
     const inputBytes = estimatePayloadBytes(captured.toolInput, getLimits().maxToolPayload);
-    const parent = state.agentState.activeTurn ?? state.agentState.root;
+    const parent = state.agentState.activeTurn ?? state.agentState.activeAttempt ?? state.agentState.root;
     const tool = await startChildObservation({
       parent,
       runtime: getRuntime,
