@@ -242,12 +242,31 @@ test("escaped quoted assignments keep whitespace, inner quotes, and adjacent seg
     "COLOR=blue PRIVATE-KEY=[REDACTED_SECRET] TOKEN=[REDACTED_SECRET]");
 });
 
-test("large key-like text stays bounded without blocking capture", () => {
+test("large key-like and escaped JSON text stays bounded without blocking capture", () => {
   // A separate process can be killed even when a regex blocks its event loop.
   execFileSync(process.execPath, ["--import", "tsx", "--import",
     new URL("./reset-ambient-env.ts", import.meta.url).href,
     new URL("./fixtures/large-redaction-child.ts", import.meta.url).pathname,
   ], { timeout: 5_000, stdio: "pipe" });
+});
+
+test("JSON field scanning preserves escaped keys and unmatched prose quote protection", () => {
+  for (const input of [
+    String.raw`{"pass\"word":"synthetic-canary"}`,
+    String.raw`{"pa\u0073sword":"synthetic-canary"}`,
+    String.raw`\"password":"synthetic-canary"`,
+    'provider said "invalid request: {"token":"synthetic-canary"}',
+  ]) {
+    assert.doesNotMatch(redactString(input), /synthetic-canary/);
+  }
+  for (const input of [
+    String.raw`{"display\"name":"ordinary"}`,
+    '{"password":"[REDACTED_SECRET]"}',
+    '"authorization"',
+    JSON.stringify({ message: '"'.repeat(100) }),
+  ]) {
+    assert.equal(redactString(input), input);
+  }
 });
 
 test("quoted values ending in escaped backslashes preserve the following diagnostic", () => {

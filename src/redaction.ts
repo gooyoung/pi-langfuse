@@ -37,11 +37,78 @@ const KNOWN_TOKEN_RE =
   /\b(?:sk-(?:lf|ant|proj|live|test)[A-Za-z0-9_-]*|pk-lf-[A-Za-z0-9_-]+|gh[pousr]_[A-Za-z0-9_]{20,}|npm_[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16})\b/g;
 const ABSOLUTE_PATH_RE =
   /(?:\/Users\/[^/\s]+|\/home\/[^/\s]+|\/private\/tmp|\/tmp|[A-Za-z]:\\Users\\[^\\\s]+)(?:[^\s"'`]*)/g;
-const SENSITIVE_FIELD_RE =
-  /^(authorization|cookie|setcookie|xapikey|apikey|token|accesstoken|refreshtoken|secret|secretkey|password|passwd|privatekey)$/;
+const SENSITIVE_FIELDS = new Set([
+  "authorization", "cookie", "setcookie", "xapikey", "apikey", "token", "accesstoken",
+  "refreshtoken", "secret", "secretkey", "password", "passwd", "privatekey",
+]);
+const MAX_SENSITIVE_FIELD_LENGTH = Math.max(...[...SENSITIVE_FIELDS].map(key => key.length));
 
 function isSensitiveField(key: string): boolean {
-  return SENSITIVE_FIELD_RE.test(key.replace(/[^a-zA-Z0-9]/g, "").toLowerCase());
+  return SENSITIVE_FIELDS.has(key.replace(/[^a-zA-Z0-9]/g, "").toLowerCase());
+}
+
+function inspectJsonFields(text: string, exceededBudget: () => boolean): boolean {
+  let inKey = false;
+  let validKey = true;
+  let normalizedKey = "";
+  const maskedValue = /\s*"\[REDACTED_SECRET\]"(?=\s*[,}\]]|\s*$)/y;
+
+  function appendKeyCharacter(char: string) {
+    // Keep one extra character to distinguish long, non-sensitive names.
+    if (normalizedKey.length <= MAX_SENSITIVE_FIELD_LENGTH && /[a-zA-Z0-9]/.test(char)) {
+      normalizedKey += char.toLowerCase();
+    }
+  }
+
+  // Scan each candidate once. Interior escaped quotes share its closing quote;
+  // retrying from them after a failed match would rescan the same suffix.
+  // Reuse a closing quote as the next opener when it is not followed by a colon,
+  // so an unmatched prose quote cannot hide a later JSON field.
+  for (let index = 0; index < text.length; index++) {
+    const char = text[index];
+    if (!inKey) {
+      if (char !== '"') continue;
+      inKey = true;
+      validKey = true;
+      normalizedKey = "";
+      continue;
+    }
+    if (char === '"') {
+      let colon = index + 1;
+      while (colon < text.length && /\s/.test(text[colon])) colon++;
+      if (text[colon] === ":") {
+        if (exceededBudget()) return true;
+        if (validKey && SENSITIVE_FIELDS.has(normalizedKey)) {
+          maskedValue.lastIndex = colon + 1;
+          if (!maskedValue.test(text)) return true;
+        }
+        inKey = false;
+        index = colon;
+      }
+      validKey = true;
+      normalizedKey = "";
+    } else if (char === "\\") {
+      const escaped = text[++index];
+      if (escaped === undefined || /[\n\r\u2028\u2029]/.test(escaped)) {
+        inKey = false;
+      } else if (escaped === "u") {
+        const hex = text.slice(index + 1, index + 5);
+        if (/^[0-9a-f]{4}$/i.test(hex)) {
+          appendKeyCharacter(String.fromCharCode(parseInt(hex, 16)));
+          index += 4;
+        } else {
+          validKey = false;
+        }
+      } else if (!'"\\/bfnrt'.includes(escaped)) {
+        validKey = false;
+      }
+    } else if (char.charCodeAt(0) < 0x20) {
+      validKey = false;
+    } else {
+      appendKeyCharacter(char);
+    }
+  }
+  return false;
 }
 
 /** Recognize unmasked fields even when surrounding prose prevents parsing the JSON. */
@@ -49,17 +116,7 @@ export function hasUnredactedSensitiveJsonField(value: string): boolean {
   const { maxDepth, maxNodes } = getLimits();
   let nodes = 0;
   function inspect(text: string, depth: number): boolean {
-    // Prose can have unmatched quotes, so find keys independently of complete literals.
-    for (const match of text.matchAll(/"((?:\\.|[^"\\])*)"\s*:/g)) {
-      if (++nodes > maxNodes) return true;
-      try {
-        const rest = text.slice(match.index! + match[0].length);
-        if (isSensitiveField(JSON.parse(`"${match[1]}"`))
-          && !/^\s*"\[REDACTED_SECRET\]"(?=\s*[,}\]]|\s*$)/.test(rest)) return true;
-      } catch {
-        // An invalid quoted key is not a JSON field name.
-      }
-    }
+    if (inspectJsonFields(text, () => ++nodes > maxNodes)) return true;
     for (const match of text.matchAll(/"((?:\\[\s\S]?|[^"\\])*)("|$)/g)) {
       if (++nodes > maxNodes) return true;
       try {
