@@ -15,6 +15,8 @@ import {
   extractCacheMetrics,
   inferToolUpdateTransport,
   extractModelIdentity,
+  extractGenerationStatus,
+  toStatusMessage,
 } from "../utils.js";
 import type { GenerationState, ObservationUpdate } from "../types.js";
 import { applyCapturePolicy } from "../capture-policy.js";
@@ -114,50 +116,19 @@ export function updateGenerationMetadata(event: Record<string, unknown>) {
 
   const key = getRequestKey(event, "");
   const metadata = applyCapturePolicy({ metadata: extractResponseMetadata(event) }, getCapturePolicy()).metadata ?? {};
-  if (!key) {
-    const generation = getOpenGeneration();
-    if (generation) {
-      generation.metadata = { ...generation.metadata, ...metadata };
-      
-      const isError = 
-        (typeof metadata.status === "number" && metadata.status >= 400) || 
-        event.error || 
-        event.isError;
-        
-      if (isError) {
-        generation.observation.update({ 
-          metadata: generation.metadata,
-          level: "ERROR",
-          statusMessage: String(event.error ?? metadata.statusMessage ?? "Provider request failed")
-        }).end();
-        generation.ended = true;
-      } else {
-        generation.observation.update({ metadata: generation.metadata });
-      }
-    }
-    return;
-  }
+  const generation = (key ? state.agentState.activeGenerations.get(key) : undefined) ?? getOpenGeneration();
+  if (!generation || generation.ended) return;
 
-  const generation = state.agentState.activeGenerations.get(key) ?? getOpenGeneration();
-  if (generation) {
-    generation.metadata = { ...generation.metadata, ...metadata };
-    
-    const isError = 
-      (typeof metadata.status === "number" && metadata.status >= 400) || 
-      event.error || 
-      event.isError;
-      
-    if (isError) {
-      generation.observation.update({ 
-        metadata: generation.metadata,
-        level: "ERROR",
-        statusMessage: String(event.error ?? metadata.statusMessage ?? "Provider request failed")
-      }).end();
-      generation.ended = true;
-    } else {
-      generation.observation.update({ metadata: generation.metadata });
-    }
+  generation.metadata = { ...generation.metadata, ...metadata };
+  const isError = (typeof metadata.status === "number" && metadata.status >= 400) || event.error || event.isError;
+  if (isError) {
+    generation.errorStatus = {
+      level: "ERROR",
+      statusMessage: toStatusMessage(event.error ?? metadata.statusMessage ?? "Provider request failed"),
+    };
   }
+  // The assistant message supplies final error details and usage; close there.
+  generation.observation.update({ metadata: generation.metadata, ...generation.errorStatus });
 }
 
 export function recordTTFT(event: Record<string, unknown>) {
@@ -218,7 +189,12 @@ export async function finishGenerationFromMessage(event: Record<string, unknown>
   const cacheMetrics = extractCacheMetrics({ ...event, message });
   const modelParameters = extractModelParameters(getProviderPayload(event)) ?? generation.modelParameters;
   const actual = extractModelIdentity(message.model ?? event.model, message.provider ?? event.provider);
+  const finishReason = message.finishReason ?? message.stopReason;
   const update: ObservationUpdate = {
+    ...(generation.errorStatus && ["stop", "toolUse", "length"].includes(String(finishReason))
+      ? { level: "DEFAULT" as const, statusMessage: "" }
+      : {}),
+    ...extractGenerationStatus(message),
     output,
     model: actual.model ?? (generation.metadata.actualModel as string | undefined) ?? (state.currentModel || undefined),
     modelParameters,
@@ -228,7 +204,7 @@ export async function finishGenerationFromMessage(event: Record<string, unknown>
       ...generation.metadata,
       ...(actual.model ? { actualModel: actual.model } : {}),
       ...(actual.provider ? { provider: actual.provider, actualProvider: actual.provider } : {}),
-      finishReason: message.finishReason ?? message.stopReason ?? event.finishReason,
+      finishReason: finishReason ?? event.finishReason,
       ...cacheMetrics,
     },
   };
@@ -270,6 +246,7 @@ export async function createFallbackGenerationFromTurn(event: Record<string, unk
           actualModel: actual.model,
           actualProvider: actual.provider,
           sourceEvent: "turn_end",
+          finishReason: message.finishReason ?? message.stopReason ?? event.finishReason,
           promptStateHash: state.agentState.promptStateHash,
           toolStateHash: state.agentState.toolStateHash,
           systemStateSequence: state.agentState.systemStateSequence,
@@ -285,6 +262,7 @@ export async function createFallbackGenerationFromTurn(event: Record<string, unk
       runtime: getRuntime,
       name: "llm-generation",
       body: {
+        ...extractGenerationStatus(message),
         input: captured.input,
         output: captured.output,
         model: actual.model ?? (state.currentModel || undefined),

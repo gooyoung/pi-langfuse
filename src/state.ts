@@ -13,6 +13,9 @@ export interface SessionRunState {
   lastPromptStateHash?: string;
   lastToolStateHash?: string;
   lastActiveTools: string[];
+  parentSessionId?: string;
+  sessionKind?: "subagent" | "fork";
+  lineageResolved: boolean;
   systemStateSequence: number;
   seenSystemEntryIds: Set<string>;
   seenUsageEntryIds: Set<string>;
@@ -34,6 +37,7 @@ function createSessionRunState(): SessionRunState {
     tracingDisabled: false,
     setupAttemptedThisSession: false,
     lastActiveTools: [],
+    lineageResolved: false,
     systemStateSequence: 0,
     seenSystemEntryIds: new Set(),
     seenUsageEntryIds: new Set(),
@@ -147,6 +151,9 @@ export function resetRunState(sessionId = getActiveSessionId()) {
     lastPromptStateHash: previous?.lastPromptStateHash,
     lastToolStateHash: previous?.lastToolStateHash,
     lastActiveTools: previous?.lastActiveTools ?? [],
+    parentSessionId: previous?.parentSessionId,
+    sessionKind: previous?.sessionKind,
+    lineageResolved: previous?.lineageResolved ?? false,
     systemStateSequence: previous?.systemStateSequence ?? 0,
     seenSystemEntryIds: previous?.seenSystemEntryIds ?? new Set(),
     seenUsageEntryIds: previous?.seenUsageEntryIds ?? new Set(),

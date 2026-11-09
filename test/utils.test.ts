@@ -10,7 +10,115 @@ import {
   inferToolUpdateTransport,
   normalizeContentForLangfuse,
   shapePayload,
+  toStatusMessage,
 } from "../src/utils.ts";
+import { state } from "../src/state.ts";
+import { DEFAULT_LIMITS } from "../src/limits.ts";
+
+test("toStatusMessage reads text out of wrapped tool results instead of [object Object]", () => {
+  assert.equal(
+    toStatusMessage({ isError: true, content: [{ type: "text", text: "Validation failed: answer required" }] }, 1_000),
+    "Validation failed: answer required",
+  );
+  assert.equal(toStatusMessage({ output: { text: "nested failure" } }, 1_000), "nested failure");
+  assert.equal(toStatusMessage("plain failure", 1_000), "plain failure");
+  assert.equal(
+    toStatusMessage('{"isError":true,"content":[{"type":"text","text":"prefill failed"}]}', 1_000),
+    "prefill failed",
+  );
+  assert.equal(toStatusMessage('{"error":"quota exceeded"}', 1_000), '{"error":"quota exceeded"}');
+  assert.equal(toStatusMessage({ code: 500 }, 1_000), '{"code":500}');
+
+  const circular: Record<string, unknown> = { message: "boom" };
+  circular.self = circular;
+  assert.equal(toStatusMessage(circular, 1_000), "boom");
+  assert.equal(toStatusMessage(new Error("tool exploded"), 1_000), "tool exploded");
+
+  assert.equal(toStatusMessage("x".repeat(20), 5), "xxxxx... [truncated]");
+});
+
+test("status text masks sensitive fields before formatting objects and nested JSON", () => {
+  const error = { error: "quota exceeded", apiKey: "synthetic-private-value", password: "synthetic-password" };
+  for (const value of [
+    error,
+    JSON.stringify(error),
+    { content: [{ type: "text", text: JSON.stringify(error) }] },
+    new Error(JSON.stringify(error)),
+  ]) {
+    const status = toStatusMessage(value);
+    assert.match(status, /quota exceeded/);
+    assert.doesNotMatch(status, /synthetic-private-value|synthetic-password/);
+  }
+});
+
+test("status text omits oversized JSON rather than disclosing a truncated secret", () => {
+  const value = JSON.stringify({ password: "synthetic-password", padding: "x".repeat(2_000) });
+  assert.equal(toStatusMessage(value, 100), "[payload too large]");
+});
+
+test("status text with JSON and surrounding diagnostics fails closed", () => {
+  for (const value of [
+    '[provider] {"token":"synthetic-token-value"}',
+    '{"token":"synthetic-token-value"}\n\nCommand exited with code 1',
+    'HTTP 400: {"password":"synthetic-token-value"} (request failed)',
+    'HTTP 400: {"password":"synthetic-token-value"',
+  ]) {
+    assert.equal(toStatusMessage(value), "[unparseable error payload]");
+  }
+  assert.equal(toStatusMessage("[provider] connection failed"), "[provider] connection failed");
+});
+
+test("replayed tool errors cannot expose JSON secrets in the next provider payload", () => {
+  for (const text of [
+    '{"token":"synthetic-token-value"}\n\nCommand exited with code 1',
+    '[provider] {"password":"synthetic-token-value"}',
+    'HTTP 400: {"pa\\u0073sword":"synthetic-token-value"} (request failed)',
+  ]) {
+    const payload = { messages: [{ role: "tool", content: text }] };
+    assert.doesNotMatch(JSON.stringify(shapePayload(payload)), /synthetic-token-value/);
+  }
+  const ordinary = 'Example {"answer":42} followed by explanation';
+  assert.equal(shapePayload(ordinary), ordinary);
+});
+
+test("prefixed error shaping stays bounded without changing ordinary text capture", () => {
+  const json = JSON.stringify({ password: "synthetic-password", padding: "x".repeat(2_000) });
+  assert.equal(toStatusMessage(`Compaction failed: ${json}`, 100), "[payload too large]");
+  const text = 'Read the object { then continue with prose ' + 'x'.repeat(200);
+  assert.equal(shapePayload(text, { maxString: 100 }), text.slice(0, 100) + "... [truncated]");
+  for (const value of [
+    { content: [{ type: "text", text: '429 {"password":"synthetic-password"}' }] },
+    { error: new Error('Compaction failed: {"password":"synthetic-password"}') },
+  ]) assert.doesNotMatch(toStatusMessage(value), /synthetic-password/);
+});
+
+test("status text respects object traversal limits before serialization", () => {
+  let accessed = 0;
+  const value = Object.create(null);
+  for (let index = 0; index < 10_000; index++) {
+    Object.defineProperty(value, `field${index}`, { enumerable: true, get() { accessed++; return index; } });
+  }
+  toStatusMessage(value);
+  assert.equal(accessed, 80);
+});
+
+test("status text honors a smaller configured string limit", () => {
+  const previousConfig = state.config;
+  state.config = { publicKey: "pk_test", secretKey: "sk_test", host: "https://example.invalid",
+    limits: { ...DEFAULT_LIMITS, maxString: 40 } };
+  try {
+    assert.equal(toStatusMessage("x".repeat(500), 1_000), "x".repeat(40) + "... [truncated]");
+  } finally { state.config = previousConfig; }
+});
+
+test("nested Error messages and their stack copies cannot disclose JSON credentials", () => {
+  const error = new Error(JSON.stringify({ error: "quota exceeded", apiKey: "synthetic-private-value", password: "synthetic-password" }));
+  for (const value of [{ error }, { content: [{ type: "text", text: error }] }]) {
+    const status = toStatusMessage(value);
+    assert.match(status, /quota exceeded/);
+    assert.doesNotMatch(status, /synthetic-private-value|synthetic-password/);
+  }
+});
 
 test("inferToolUpdateTransport detects provider-native and collapsed tool updates", () => {
   assert.equal(

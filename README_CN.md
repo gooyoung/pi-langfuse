@@ -159,6 +159,18 @@ export PI_LANGFUSE_MAX_PAYLOAD_NODES=2000        # 单个负载的最大总节�
 任意上限设置为 `0`、`off`、`none` 或 `unlimited` 即表示关闭该限制（采集完整值）；未设置或非法值回退到上方默认值。
 若想完整采集很大的 system prompt 或工具负载，可以调高或关闭相关限制（例如 `PI_LANGFUSE_MAX_STRING_LENGTH=off`）。
 
+若错误文本中的 JSON 因前后附加的诊断信息而无法解析，状态和采集的工具错误输出会使用
+`[unparseable error payload]`，避免原始敏感字段泄露。
+后续模型请求中重放的错误文本也会检查敏感 JSON 字段；不含这些字段的普通文本保持不变。
+纯字符串采集路径（包括助手回复、压缩摘要和自定义 ID）会将含有未脱敏 JSON 敏感字段的文本
+替换为 `[REDACTED_SECRET]`。已脱敏字段和普通文本保持不变，输出仍为字符串。
+该检查还会在现有深度和节点数量限制内解码嵌套 JSON 字符串。转义内容无法安全解析或检查预算耗尽时，
+会隐藏整个字符串，避免暴露未经检查的内容。
+凭据赋值无论是否带引号都会脱敏，包括转义或未闭合的引号。序列化文本中的转义引号会保护整个值，包括空格。
+如果单引号的转义层级不明确，后续诊断文本也可能被隐藏。
+已知格式的令牌会在字符串截断前
+脱敏，避免跨越采集长度上限的令牌因变成短片段而绕过检测。
+
 REST 回退摄取会按字节切分，保证每个请求体都远低于 Langfuse 网关的负载限制（约 4.5MB）。以下变量控制切分预算
 与整个回退负载的硬上限：
 
@@ -169,6 +181,8 @@ export PI_LANGFUSE_MAX_FALLBACK_TOTAL_BYTES=33554432  # 整体负载上限，默
 ```
 
 当累积的回退负载超过 32MB 上限时，会跳过摄取并给出告警，而不是尝试一次注定失败的超大上传。
+单个事件超过单次请求体预算时，会跳过该事件并输出仅包含大小信息的告警；其余事件仍会发送。
+调高采集上限时，也需要注意这个单事件限制。
 
 ### 推理（reasoning）token
 
@@ -246,7 +260,10 @@ pi list
 /langfuse-test
 ```
 
-该命令会先发起一次带超时的认证请求；认证通过后，再发送一条小的测试 trace。
+该命令会先发起一次带超时的认证请求；认证通过后，再发送一条小的测试 trace。返回结果还会说明
+读取接口是否可用：先检查 `v2/observations`，仅当它返回 404 或 405 时回退到旧版 observations API，以兼容旧服务器。
+读取失败会显示警告，但不会阻止发送测试 trace。该检查只验证接口可用性，不保证新 trace 已可查询。
+Langfuse v4 的 `events_only` 模式移除了旧版读取接口；compaction 和错误文本修复本身不要求 v4。
 
 ## 在 Langfuse 中会看到什么
 
@@ -268,6 +285,9 @@ pi list
 - cache warming 决策及持久化的 `cache_warm` 用量会被记录；若 warming 发生时没有活动的用户请求 trace，
   会创建按相同 session 分组的独立 trace。
 - compaction 会记录为 `session-compaction`；若存在摘要用量，则包含 `compaction-summary` generation。
+  即使没有活动的 agent run（恢复性 compaction 常发生在 run 结束之后）也会记录 compaction 事件；
+  此时它们会在同一 session 下形成名为 `pi-session` 的独立 trace。发出 `session_compact_failed` 的 Pi 版本
+  会将失败的 compaction 记为 `session-compaction-failed`：失败为 `ERROR`，取消为 `WARNING`。
 - trace 级别会记录工具调用次数、工具成功率和是否出现错误。
 
 此包还包含一个内置 Langfuse 技能，可直接在 Pi 中查询 Langfuse 数据：
@@ -316,6 +336,28 @@ export OTEL_RESOURCE_ATTRIBUTES="service.version=1.2.3,vcs.repository.name=publi
 旧版本默认发送 `git_commit`、分支、remote、owner、仓库名及 `.pi-langfuse.metadata.json` 中的值。新 trace 改用 `vcs.ref.head.revision`，并停止读取该文件。启用源码采集前应更新 dashboard；历史 trace 不受影响。
 
 取消设置 `LANGFUSE_CAPTURE_SOURCE_METADATA` 可立即停止采集。迁移期间只有在必须保留旧 schema 时才固定到 `pi-langfuse@1.5.12`；这样也会恢复旧版本更宽泛的默认源码披露。
+
+## 会话血缘
+
+Pi 会把派生会话的来源文件写入会话头，扩展通过 `sessionManager.getHeader()` 读取它。这类派生会话的所有 observation 都会携带：
+
+```json
+{
+  "parentSessionId": "01a1639b-58c5-729a-8315-f17b045ccd28",
+  "sessionKind": "fork"
+}
+```
+
+当进程在 `pi-subagents` 下运行时（`PI_SUBAGENT_CHILD=1`）`sessionKind` 为 `subagent`，否则为 `fork`。该环境变量是 `pi-subagents` 的实现细节，不是本包持有的契约：子进程丢失该变量时只会标成 `fork`，即只有标签会降级——父链接本身取自会话头，始终是精确的。
+
+Langfuse 中没有会话与会话的关联关系，因此会话仍然彼此独立，只能通过 metadata 关联。解析出子会话 id 后例如：
+
+```bash
+curl -s -u "$LANGFUSE_PUBLIC_KEY:$LANGFUSE_SECRET_KEY" \
+  "$LANGFUSE_HOST/api/public/v2/observations?sessionId=<child-session-id>&fields=core,metadata"
+```
+
+根会话不携带这两个键。扩展只读取父会话 id，除指明该 id 的首行外不会打开父会话转录。
 
 ## 故障排除
 

@@ -20,6 +20,7 @@ declare module "@langfuse/otel" {
 
 declare module "@langfuse/tracing" {
   export function setLangfuseTracerProvider(provider: unknown): void;
+  export function getLangfuseTracerProvider(): unknown;
 
   export function startObservation(
     name: string,

@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 
 import { recordSystemPrompt } from "../src/handlers/agent.ts";
 import { createCapturePolicy } from "../src/capture-policy.ts";
+import { DEFAULT_LIMITS } from "../src/limits.ts";
 import {
   clearAllSessionStates,
   setCurrentSession,
@@ -94,4 +95,19 @@ test("recordSystemPrompt is a no-op without an active agent observation", async 
   await recordSystemPrompt({ getSystemPrompt: () => "prompt" });
   // No agentState.root — nothing to update, and no crash.
   assert.equal(state.agentState, null);
+});
+
+test("system prompt capture masks tokens before applying its string limit", async () => {
+  clearAllSessionStates();
+  const previousConfig = state.config;
+  state.config = { publicKey: "pk_test", secretKey: "sk_test", host: "https://example.invalid",
+    capturePolicy: createCapturePolicy({ LANGFUSE_PRIVACY_PRESET: "full-debug" }),
+    limits: { ...DEFAULT_LIMITS, maxString: 12 } };
+  try {
+    const root = new FakeObservation();
+    state.agentState = makeAgentState(root);
+    await recordSystemPrompt({ getSystemPrompt: () => "ghp_abcdefghijklmnopqrstuvwxyz123456" });
+    assert.ok(root.updates[0]?.metadata?.systemPrompt);
+    assert.doesNotMatch(String(root.updates[0]?.metadata?.systemPrompt), /ghp_/);
+  } finally { state.config = previousConfig; clearAllSessionStates(); }
 });

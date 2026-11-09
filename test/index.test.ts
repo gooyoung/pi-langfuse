@@ -51,6 +51,7 @@ test("session_shutdown waits for runtime shutdown after agent_settled", async ()
     assert.ok(agentEnd);
     assert.ok(agentSettled);
     assert.ok(sessionShutdown);
+    assert.ok(handlers.get("session_compact_failed"));
     const ctx = {
       sessionManager: { getSessionFile: () => "/tmp/pi-agent-session.jsonl" },
     };

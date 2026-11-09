@@ -11,6 +11,7 @@ import { basename } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 import { state, resetRunState, runWithSession, setCurrentSession } from "./src/state.js";
+import { bindSessionLineage } from "./src/session-lineage.js";
 import { ensureConfig, promptForConfig, loadConfig } from "./src/config.js";
 import { shutdownRuntime } from "./src/langfuse.js";
 import { handleLangfusePrivacyCommand, handleLangfuseStatusCommand, handleLangfuseTestCommand } from "./src/commands.js";
@@ -30,7 +31,7 @@ import {
   recordCacheWarmingDecision,
   recordNewUsageEntries,
 } from "./src/handlers/cache.js";
-import { recordSessionCompaction } from "./src/handlers/session.js";
+import { recordSessionCompaction, recordSessionCompactionFailure } from "./src/handlers/session.js";
 import {
   startGeneration,
   updateGenerationMetadata,
@@ -111,6 +112,7 @@ export default async function (pi: ExtensionAPI) {
     state.setupAttemptedThisSession = false;
     await ensureConfig(ctx);
     resetRunState();
+    bindSessionLineage(ctx?.sessionManager);
     initializeSystemStateTracking(ctx);
     initializeUsageTracking(ctx);
   }));
@@ -225,6 +227,10 @@ export default async function (pi: ExtensionAPI) {
 
   pi.on("session_compact", async (event, ctx) => withSession(ctx, async () => {
     await recordSessionCompaction(asRecord(event));
+  }));
+
+  pi.on("session_compact_failed", async (event, ctx) => withSession(ctx, async () => {
+    await recordSessionCompactionFailure(asRecord(event));
   }));
 
   pi.on("session_shutdown", async (_event, ctx) => withSession(ctx, async () => {

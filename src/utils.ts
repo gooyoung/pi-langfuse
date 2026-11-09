@@ -1,8 +1,9 @@
 import { getLimits } from "./limits.js";
 import { getUsageOptions, type UsageOptions } from "./usage-options.js";
 import { createCapturePolicy, redactOptionsFor, type CapturePolicy } from "./capture-policy.js";
-import { redactValue } from "./redaction.js";
+import { hasUnredactedSensitiveJsonField, redactString, redactValue } from "./redaction.js";
 import { state } from "./state.js";
+import type { ObservationUpdate } from "./types.js";
 
 export function getCapturePolicy(): CapturePolicy {
   return state.config?.capturePolicy ?? createCapturePolicy();
@@ -39,6 +40,7 @@ export function shapePayload(
     maxObjectKeys?: number;
     redact?: boolean;
     parseJson?: boolean;
+    parseJsonPrefix?: boolean;
   } = {},
 ): unknown {
   const limits = getLimits();
@@ -48,6 +50,13 @@ export function shapePayload(
   const maxArrayItems = options.maxArrayItems ?? limits.maxArrayItems;
   const maxObjectKeys = options.maxObjectKeys ?? limits.maxObjectKeys;
   const budget = { exhausted: false, nodeCount: 0 };
+  const redactionOptions = {
+    ...redactOptionsFor(getCapturePolicy()),
+    maxDepth: depth,
+    maxStringLength: maxString,
+    maxArrayItems,
+    maxObjectKeys,
+  };
 
   function visit(item: unknown, remainingDepth: number, seen: WeakSet<object>): unknown {
     if (budget.exhausted) {
@@ -61,15 +70,31 @@ export function shapePayload(
     }
 
     if (typeof item === "string") {
+      const jsonStart = options.parseJsonPrefix ? item.search(/[\[{]/) : item.search(/^[\s]*[\[{]/);
+      // Truncated JSON loses field names needed for secret redaction.
+      if (options.parseJson !== false && jsonStart >= 0 && item.length > maxString) {
+        return PAYLOAD_TOO_LARGE;
+      }
       const truncated = truncate(item, maxString);
       if (options.parseJson === false) {
-        return truncated;
+        return options.redact === false ? truncated : redactString(item, redactionOptions);
       }
-      const parsed = tryParseJson(truncated);
-      if (parsed === truncated) {
-        return truncated;
+      const candidate = jsonStart > 0 ? truncated.slice(jsonStart) : truncated;
+      const parsed = tryParseJson(candidate);
+      if (parsed === candidate) {
+        // Native tool suffixes and bracketed prefixes can make JSON unparseable.
+        if (options.redact !== false && (
+          (options.parseJsonPrefix && /[\[{]\s*"/.test(truncated)) || hasUnredactedSensitiveJsonField(truncated)
+        )) return "[unparseable error payload]";
+        return options.redact === false ? truncated : redactString(item, redactionOptions);
       }
-      return visit(parsed, remainingDepth - 1, seen);
+      const shaped = visit(parsed, remainingDepth - 1, seen);
+      if (jsonStart > 0 && truncated.slice(0, jsonStart).trim()) {
+        // Pi/provider prefixes must not hide structured fields from redaction.
+        const safe = options.redact === false ? shaped : redactValue(shaped, redactionOptions);
+        return truncated.slice(0, jsonStart) + JSON.stringify(safe);
+      }
+      return shaped;
     }
 
     if (
@@ -106,11 +131,12 @@ export function shapePayload(
     }
 
     if (item instanceof Error) {
-      return {
+      // The stack repeats the raw message; retain frames without that copy.
+      return visit({
         name: item.name,
         message: item.message,
-        stack: item.stack ? truncate(item.stack, maxString) : undefined,
-      };
+        stack: item.message ? item.stack?.replaceAll(item.message, "[error message]") : item.stack,
+      }, remainingDepth, seen);
     }
 
     if (typeof item === "object") {
@@ -140,13 +166,7 @@ export function shapePayload(
   const shaped = visit(value, depth, new WeakSet<object>());
   return options.redact === false
     ? shaped
-    : redactValue(shaped, {
-        ...redactOptionsFor(getCapturePolicy()),
-        maxDepth: depth,
-        maxStringLength: maxString,
-        maxArrayItems,
-        maxObjectKeys,
-      });
+    : redactValue(shaped, redactionOptions);
 }
 
 export function safeSerialize(value: unknown, maxLength = getLimits().maxToolPayload): string {
@@ -161,20 +181,38 @@ export function estimatePayloadBytes(value: unknown, maxLength = getLimits().max
   return new TextEncoder().encode(safeSerialize(value, maxLength)).length;
 }
 
-export function extractTextContent(content: unknown, maxLength?: number): string | undefined {
+export function extractTextContent(content: unknown, maxLength?: number, depth = 0): string | undefined {
   if (typeof content === "string") {
     return maxLength ? truncate(content, maxLength) : content;
   }
 
   if (!Array.isArray(content)) {
+    // Tool results arrive wrapped ({ content: [{ type: "text", text }] }, or with
+    // the payload under result/output/text). The wrapper alone stringifies to
+    // "[object Object]", so dig out the text the reader actually wants; the depth
+    // cap keeps a reference cycle from recursing forever.
+    if (content && typeof content === "object" && depth < 2) {
+      const wrapper = content as { content?: unknown; result?: unknown; output?: unknown; text?: unknown };
+      for (const nested of [wrapper.content, wrapper.result, wrapper.output, wrapper.text]) {
+        if (!nested || nested === content) {
+          continue;
+        }
+        const unwrapped = extractTextContent(nested, maxLength, depth + 1);
+        if (unwrapped) {
+          return unwrapped;
+        }
+      }
+    }
     return undefined;
   }
 
   const text = content
     .map((item) => {
       if (!item || typeof item !== "object") return "";
-      const block = item as { type?: string; text?: string; thinking?: string };
-      return block.type === "text" && block.text ? block.text : "";
+      const block = item as { type?: string; text?: unknown };
+      return block.type === "text" && block.text
+        ? typeof block.text === "string" ? block.text : safeSerialize(block.text, maxLength)
+        : "";
     })
     .filter(Boolean)
     .join("\n");
@@ -184,6 +222,31 @@ export function extractTextContent(content: unknown, maxLength?: number): string
   }
 
   return maxLength ? truncate(text, maxLength) : text;
+}
+
+/**
+ * Human-readable text for an observation `statusMessage`: text blocks first, then
+ * the string, then JSON, so a structured error never lands as "[object Object]"
+ * or as a wall of escaped JSON. Shape and redact before extracting any text.
+ */
+export function toStatusMessage(value: unknown, maxLength = 1_000): string {
+  maxLength = Math.min(maxLength, getLimits().maxString);
+  const shaped = shapePayload(value instanceof Error ? value.message || String(value) : value, {
+    maxString: maxLength, parseJsonPrefix: true,
+  });
+  const text = extractTextContent(shaped, maxLength);
+  if (text) {
+    return text;
+  }
+  const message = (shaped as { message?: unknown } | null)?.message;
+  if (typeof message === "string" && message) {
+    return truncate(message, maxLength);
+  }
+  try {
+    return truncate(JSON.stringify(shaped) ?? String(shaped), maxLength);
+  } catch {
+    return "[unserializable error]";
+  }
 }
 
 export function normalizeContentForLangfuse(content: unknown, api?: string): unknown {
@@ -408,6 +471,19 @@ export function extractModelParameters(payload: unknown): Record<string, string 
   }
 
   return Object.keys(params).length > 0 ? params : undefined;
+}
+
+export function extractGenerationStatus(message: Record<string, unknown>): ObservationUpdate {
+  const reason = message.finishReason ?? message.stopReason;
+  if (reason !== "error" && reason !== "aborted") return {};
+
+  return {
+    level: reason === "error" ? "ERROR" : "WARNING",
+    statusMessage: toStatusMessage(
+      message.errorMessage || (reason === "error" ? "Generation failed" : "Generation aborted"),
+      getLimits().maxString,
+    ),
+  };
 }
 
 export function getMessageFromEvent(event: Record<string, unknown>): Record<string, unknown> | undefined {

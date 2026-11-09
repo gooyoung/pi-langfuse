@@ -24,7 +24,7 @@
 	],
 	"scripts": {
 		"typecheck": "tsc --noEmit",
-		"test": "tsx --test test/*.test.ts"
+		"test": "tsx --import=./test/reset-ambient-env.ts --test test/*.test.ts"
 	},
 	"keywords": [
 		"pi-package",

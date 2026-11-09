@@ -11,7 +11,8 @@ Langfuse observability extension for [Pi Coding Agent](https://github.com/earend
 
 - One Langfuse trace per user prompt, grouped by Pi session.
 - Root `agent`, per-request `generation`, and per-tool `tool` observations.
-- Final assistant output capture, tool error visibility, and trace-level scores.
+- Foreground child sessions keep their SDK exporters isolated, so parent telemetry continues after a child exits.
+- Final assistant output capture, generation/tool error visibility, and trace-level scores.
 - Privacy controls for inputs, outputs, tool I/O, system prompt, and cwd.
 - Secret redaction and local path hashing before upload.
 - Capability-gated REST fallback for self-hosted Langfuse setups that expose the legacy trace API when OTel spans arrive but traces do not materialize. Langfuse v4 `events_only` deployments use OTel without legacy fallback ingestion.
@@ -165,6 +166,28 @@ defaults shown above. To capture a very large system prompt or big tool
 payloads in full, raise or disable the relevant limit (e.g.
 `PI_LANGFUSE_MAX_STRING_LENGTH=off`).
 
+JSON strings above the string limit are replaced with `[payload too large]` rather
+than cut into invalid JSON that could bypass sensitive-field redaction. Error
+status text uses the same shaping and redaction limits, even when IO capture is disabled.
+Status formatting also masks JSON credentials after Pi/provider error prefixes.
+If surrounding diagnostics make structured error text unparseable, status and
+captured tool-error output use `[unparseable error payload]` instead of the raw text.
+The same protection applies to unparseable JSON fragments with sensitive field
+names replayed inside later provider requests; ordinary surrounding text is retained
+when it contains no sensitive JSON fields.
+String-only capture paths (including assistant replies, compaction summaries, and
+custom IDs) replace text containing unmasked sensitive JSON fields with
+`[REDACTED_SECRET]`. Already-masked fields and ordinary text stay intact; captured
+output remains a string.
+This check also decodes nested JSON strings within the existing depth/node limits.
+Ambiguous escaped text or exhausted inspection limits hide the string rather than expose unchecked content.
+Credential assignments are masked with or without quotes, including escaped or
+unterminated values. Escaped quotes in serialized text protect the entire value,
+including spaces.
+Ambiguous single-quote escaping can also mask the remaining diagnostic text.
+Known tokens are masked before string truncation so a token
+crossing a capture limit cannot escape detection as a shorter fragment.
+
 The REST fallback ingestion is chunked so each request body stays well below
 the Langfuse gateway's payload limit (~4.5MB). These knobs control the chunk
 budget and a hard ceiling for the whole fallback payload:
@@ -177,6 +200,13 @@ export PI_LANGFUSE_MAX_FALLBACK_TOTAL_BYTES=33554432  # whole-payload ceiling, d
 
 When the accumulated fallback payload exceeds the 32MB ceiling, ingestion is
 skipped with a warning instead of attempting an unrecoverably large upload.
+An individual event above the per-request budget is skipped with a size-only
+warning; the remaining events are still sent. Raise capture limits with this
+per-event ceiling in mind.
+Fallback checks each trace separately within one visibility window and restores
+only missing traces, preserving each trace's session, user, name, and metadata.
+Visibility polling uses at most three quarters of the remaining shutdown time,
+leaving the rest for ingestion even when SDK cleanup was slow.
 
 ### Reasoning tokens
 
@@ -266,6 +296,10 @@ To verify the Langfuse host and API keys from inside Pi, run:
 ```
 
 This command makes a timeout-bounded authenticated request to Langfuse and, if it succeeds, sends a small test trace.
+The result also probes the observations read API. It tries `v2/observations` first and falls back to the legacy
+observations API only when v2 returns 404 or 405, so older servers remain supported. Read failures produce a
+warning and do not block the test trace. This checks endpoint availability, not whether the new trace is queryable.
+Langfuse v4 in `events_only` mode removes legacy reads; the compaction and error-text fixes do not require v4.
 
 ## What Appears in Langfuse
 
@@ -278,6 +312,9 @@ This command makes a timeout-bounded authenticated request to Langfuse and, if i
   include descendants are not ingested again. Pi's tool usage does not identify each nested model,
   so these aggregate generations have no inferred model name or price.
 - LLM requests appear as generation observations, including usage and cost when the provider exposes them.
+  Failed assistant messages are marked `ERROR` with a redacted `statusMessage`, including streaming
+  failures after HTTP 200 and failures without provider hooks. User-aborted generations are `WARNING`.
+  A successful final assistant response clears an earlier transient HTTP error from an internal retry.
   Reasoning tokens are reported as their own usage bucket when `PI_LANGFUSE_SPLIT_REASONING_TOKENS` is enabled.
   Virtual routing preserves `selectedModel`/`selectedProvider` alongside `actualModel`/`actualProvider`;
   the generation model and `provider` metadata use the actual identity when available.
@@ -289,7 +326,12 @@ This command makes a timeout-bounded authenticated request to Langfuse and, if i
 - Cache-warming decisions and persisted `cache_warm` usage are reported, including standalone session-grouped
   traces when warming happens while no user-request trace is active.
 - Compaction is recorded as `session-compaction`, with a nested `compaction-summary` generation when usage is available.
-- Trace-level scores include tool counts, tool success rate, and whether the run had errors.
+  Both compaction events are recorded even when no agent run is active — recovery compaction often lands after the
+  run settled — and then form their own trace named `pi-session` inside the same session.
+- On Pi versions that emit `session_compact_failed`, failed compactions appear as
+  `session-compaction-failed` events: `ERROR` for failures and `WARNING` for cancellations.
+  Pi reports a cancelling extension as an abort and may omit its original error text.
+- Trace-level scores include tool counts, tool success rate, and whether the run had tool errors.
 
 The package also includes a Langfuse CLI skill, so Langfuse data can be queried directly from Pi:
 
@@ -337,6 +379,30 @@ export OTEL_RESOURCE_ATTRIBUTES="service.version=1.2.3,vcs.repository.name=publi
 Earlier versions emitted `git_commit`, branch, remote, owner, repository, and repo-local `.pi-langfuse.metadata.json` values by default. New traces use `vcs.ref.head.revision` and stop reading that file. Update dashboards before enabling source capture; historical traces are unchanged.
 
 Unset `LANGFUSE_CAPTURE_SOURCE_METADATA` to stop collection immediately. Pin `pi-langfuse@1.5.12` only if the old schema is required during migration; doing so also restores its broader default source disclosure.
+
+## Session Lineage
+
+Pi writes the session file a session was forked or spawned from into its header, and the extension reads it through `sessionManager.getHeader()`. Every observation of such a derived session then carries:
+
+```json
+{
+  "parentSessionId": "01a1639b-58c5-729a-8315-f17b045ccd28",
+  "sessionKind": "fork"
+}
+```
+
+`sessionKind` is `subagent` when `pi-subagents` sets `PI_SUBAGENT_CHILD=1` and `fork` otherwise. That environment flag is a `pi-subagents` implementation detail, not a contract this package owns. Foreground children may omit it and receive the `fork` label; the parent link still comes from the session header. Normal parent UUIDs remain exact, while custom IDs pass through secret and path redaction before upload, including standalone traces.
+
+Sessions remain separate in Langfuse, because Langfuse has no session-to-session relation. Correlate through metadata instead, for example after resolving a child session id:
+
+```bash
+curl -s -u "$LANGFUSE_PUBLIC_KEY:$LANGFUSE_SECRET_KEY" \
+  "$LANGFUSE_HOST/api/public/v2/observations?sessionId=<child-session-id>&fields=core,metadata"
+```
+
+Root sessions carry neither key. Only the parent session id is read; the parent transcript is never opened beyond the header line that names it.
+Standalone compaction and idle cache-warming traces retain these links, including
+cache-warming usage and costs, through both OTel export and REST fallback.
 
 ## Troubleshooting
 

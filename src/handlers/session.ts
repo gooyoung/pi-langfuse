@@ -1,15 +1,76 @@
 import { applyCapturePolicy } from "../capture-policy.js";
 import { getRuntime } from "../langfuse.js";
-import { startChildObservation } from "../observation.js";
+import { startChildObservation, startSessionObservation } from "../observation.js";
 import { state } from "../state.js";
+import { sessionLineageMetadata } from "../session-lineage.js";
 import {
   extractCostDetails,
+  extractGenerationStatus,
   extractUsage,
   getCapturePolicy,
   shapePayload,
+  truncate,
 } from "../utils.js";
+import type { LangfuseObservation, ObservationUpdate } from "../types.js";
 
 type RecordLike = Record<string, unknown>;
+
+// Compaction can fire after the run already settled, so the event has no agent
+// root to nest under. A rootless observation still belongs to the session, hence
+// its own trace name instead of being dropped.
+const SESSION_TRACE_NAME = "pi-session";
+
+function startCompactionObservation(
+  name: string,
+  body: ObservationUpdate,
+  asType: "event" | "span",
+): Promise<LangfuseObservation> {
+  const agent = state.agentState;
+  const parent = agent?.activeTurn ?? agent?.activeAttempt ?? agent?.root;
+  if (parent) {
+    return startChildObservation({ parent, runtime: getRuntime, name, body, asType });
+  }
+
+  return startSessionObservation({
+    runtime: getRuntime,
+    name,
+    body,
+    asType,
+    attributes: {
+      sessionId: state.currentSessionId ? truncate(state.currentSessionId, 200) : undefined,
+      userId: state.config?.userId,
+      traceName: SESSION_TRACE_NAME,
+      metadata: { piScope: "session", ...sessionLineageMetadata() },
+    },
+  });
+}
+
+export async function recordSessionCompactionFailure(event: RecordLike): Promise<void> {
+  if (state.isTracingDisabled) return;
+
+  try {
+    const observation = await startCompactionObservation(
+      "session-compaction-failed",
+      {
+        ...extractGenerationStatus({
+          stopReason: event.aborted ? "aborted" : "error",
+          errorMessage: event.errorMessage
+            || (event.aborted ? "Compaction cancelled" : "Compaction failed"),
+        }),
+        metadata: shapePayload({
+          reason: event.reason,
+          aborted: event.aborted,
+          willRetry: event.willRetry,
+          fromExtension: event.fromExtension,
+        }) as RecordLike,
+      },
+      "event",
+    );
+    observation.end();
+  } catch (error) {
+    console.warn("📊 Langfuse: Failed to record compaction failure", error);
+  }
+}
 
 function namesFromTools(value: unknown): string[] {
   if (!Array.isArray(value)) return [];
@@ -22,9 +83,9 @@ function namesFromTools(value: unknown): string[] {
 }
 
 export async function recordSessionCompaction(event: RecordLike): Promise<void> {
-  const agent = state.agentState;
-  if (state.isTracingDisabled || !agent?.root) return;
+  if (state.isTracingDisabled) return;
 
+  const agent = state.agentState;
   const entry = event.compactionEntry && typeof event.compactionEntry === "object"
     ? event.compactionEntry as RecordLike
     : {};
@@ -48,22 +109,19 @@ export async function recordSessionCompaction(event: RecordLike): Promise<void> 
         checkpointSectionNames: checkpointSections,
         checkpointToolNames: checkpointTools,
         checkpointToolCount: checkpointTools.length,
-        promptStateHash: agent.promptStateHash,
-        toolStateHash: agent.toolStateHash,
+        promptStateHash: agent?.promptStateHash,
+        toolStateHash: agent?.toolStateHash,
       },
     },
     getCapturePolicy(),
   );
 
   try {
-    const parent = agent.activeTurn ?? agent.activeAttempt ?? agent.root;
-    const compaction = await startChildObservation({
-      parent,
-      runtime: getRuntime,
-      name: "session-compaction",
-      body: { input: captured.input, metadata: captured.metadata },
-      asType: "span",
-    });
+    const compaction = await startCompactionObservation(
+      "session-compaction",
+      { input: captured.input, metadata: captured.metadata },
+      "span",
+    );
 
     if (entry.usage && typeof entry.usage === "object") {
       const summary = applyCapturePolicy({ output: entry.summary }, getCapturePolicy());

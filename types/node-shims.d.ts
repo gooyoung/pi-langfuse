@@ -3,6 +3,15 @@ declare module "node:fs" {
   export function readFileSync(path: string, encoding: string): string;
   export function existsSync(path: string): boolean;
   export function writeFileSync(path: string, data: string, encoding: string): void;
+  export function openSync(path: string, flags: string): number;
+  export function readSync(
+    fd: number,
+    buffer: { length: number },
+    offset: number,
+    length: number,
+    position: number | null,
+  ): number;
+  export function closeSync(fd: number): void;
 }
 
 declare module "node:crypto" {

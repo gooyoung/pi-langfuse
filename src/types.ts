@@ -122,6 +122,7 @@ export interface GenerationState {
   observation: LangfuseObservation;
   requestKey: string;
   ended: boolean;
+  errorStatus?: Pick<ObservationUpdate, "level" | "statusMessage">;
   metadata: Record<string, unknown>;
   modelParameters?: Record<string, string | number>;
   ttftRecorded?: boolean;

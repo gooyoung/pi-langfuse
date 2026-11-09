@@ -8,6 +8,7 @@ import { pathToFileURL } from "node:url";
 
 import registerExtension from "../index.ts";
 import { createCapturePolicy } from "../src/capture-policy.ts";
+import { DEFAULT_LIMITS } from "../src/limits.ts";
 import { startToolObservation, finishToolObservation } from "../src/handlers/tool.ts";
 import { startGeneration, finishGenerationFromMessage, createFallbackGenerationFromTurn, recordGenerationIdentity } from "../src/handlers/generation.ts";
 import { __setRuntimeForTest } from "../src/langfuse.ts";
@@ -96,6 +97,52 @@ test("execution-end-only usage is captured and missing parents fall back to the 
   assert.equal(root.children.length, 0);
   assert.equal(turn.children[0].body.metadata?.parentToolCallId, "missing");
   assert.equal(turn.children[0].children[0].body.costDetails?.total, 0.03);
+}));
+
+test("structured tool errors stay redacted with tool IO disabled", async () => withState(async () => {
+  const root = new Observation();
+  state.agentState = agent(root);
+  await startToolObservation({ toolCallId: "failed-tool", toolName: "synthetic" });
+  await finishToolObservation({
+    toolCallId: "failed-tool", isError: true,
+    error: { error: "quota exceeded", apiKey: "synthetic-private-value", password: "synthetic-password" },
+  });
+  const tool = root.children[0];
+  assert.equal(tool.body.output, undefined);
+  assert.equal(tool.body.level, "ERROR");
+  assert.match(tool.body.statusMessage!, /quota exceeded/);
+  assert.doesNotMatch(tool.body.statusMessage!, /synthetic-private-value|synthetic-password/);
+  assert.equal(tool.endCount, 1);
+}));
+
+test("native shell error suffixes cannot expose JSON secrets in status or tool output", async () => withState(async () => {
+  for (const preset of ["metadata-only", "full-debug"]) {
+    state.config!.capturePolicy = createCapturePolicy({ LANGFUSE_PRIVACY_PRESET: preset });
+    const root = new Observation();
+    state.agentState = agent(root);
+    await startToolObservation({ toolCallId: "shell-error", toolName: "bash" });
+    await finishToolObservation({ toolCallId: "shell-error", isError: true, content: [
+      { type: "text", text: '{"token":"synthetic-token-value"}\n\nCommand exited with code 1' },
+    ] });
+    const body = root.children[0].body;
+    assert.equal(body.level, "ERROR");
+    assert.equal(body.statusMessage, "[unparseable error payload]");
+    assert.equal(body.output, preset === "metadata-only" ? undefined : "[unparseable error payload]");
+  }
+}));
+
+test("tool text tokens are masked before the tool payload limit", async () => withState(async () => {
+  state.config!.capturePolicy = createCapturePolicy({ LANGFUSE_PRIVACY_PRESET: "full-debug" });
+  state.config!.limits = { ...DEFAULT_LIMITS, maxToolPayload: 12 };
+  const root = new Observation();
+  state.agentState = agent(root);
+  await startToolObservation({ toolCallId: "bounded-tool", toolName: "bash" });
+  await finishToolObservation({ toolCallId: "bounded-tool", isError: true,
+    content: [{ type: "text", text: "ghp_abcdefghijklmnopqrstuvwxyz123456" }] });
+  const body = root.children[0].body;
+  assert.ok(body.output);
+  assert.equal(body.level, "ERROR");
+  assert.doesNotMatch(JSON.stringify({ output: body.output, status: body.statusMessage }), /ghp_/);
 }));
 
 test("virtual routing separates selected and actual identities across requests and fallback", async () => withState(async () => {

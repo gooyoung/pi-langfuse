@@ -2,6 +2,7 @@ import { applyCapturePolicy } from "../capture-policy.js";
 import { getRuntime } from "../langfuse.js";
 import { startChildObservation } from "../observation.js";
 import { getSessionRunState, state } from "../state.js";
+import { sessionLineageMetadata } from "../session-lineage.js";
 import { extractCostDetails, extractUsage, getCapturePolicy, truncate } from "../utils.js";
 
 type RecordLike = Record<string, unknown>;
@@ -67,6 +68,7 @@ export async function recordCacheWarmingDecision(event: RecordLike, ctx: any): P
         sessionId: sessionIdForTrace(),
         traceName: "pi-cache-warming",
         metadata: {
+          ...sessionLineageMetadata(ctx?.sessionManager),
           ...(ctx?.model?.id ? { model: String(ctx.model.id) } : {}),
           ...(ctx?.model?.provider ? { provider: String(ctx.model.provider) } : {}),
         },
@@ -131,11 +133,11 @@ export async function recordNewUsageEntries(ctx: any): Promise<void> {
         ? await startChildObservation({ parent, runtime: getRuntime, name: "cache-warm", body, asType: "generation" })
         : (runtime.withRootContext
             ? runtime.withRootContext(() => runtime.propagateAttributes(
-                { sessionId: sessionIdForTrace(), traceName: "pi-cache-warm" },
+                { sessionId: sessionIdForTrace(), traceName: "pi-cache-warm", metadata: sessionLineageMetadata(ctx?.sessionManager) },
                 () => runtime.startObservation("cache-warm", body, { asType: "generation" }),
               ))
             : runtime.propagateAttributes(
-                { sessionId: sessionIdForTrace(), traceName: "pi-cache-warm" },
+                { sessionId: sessionIdForTrace(), traceName: "pi-cache-warm", metadata: sessionLineageMetadata(ctx?.sessionManager) },
                 () => runtime.startObservation("cache-warm", body, { asType: "generation" }),
               ));
       observation.end();

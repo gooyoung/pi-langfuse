@@ -1,9 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { createCapturePolicy } from "../src/capture-policy.ts";
 import { recordCacheWarmingDecision, recordNewUsageEntries } from "../src/handlers/cache.ts";
-import { recordSessionCompaction } from "../src/handlers/session.ts";
+import { recordSessionCompaction, recordSessionCompactionFailure } from "../src/handlers/session.ts";
 import { __setRuntimeForTest } from "../src/langfuse.ts";
 import { clearAllSessionStates, getSessionRunState, setCurrentSession, state } from "../src/state.ts";
 import type { AgentState, Config, LangfuseObservation, LangfuseRuntime, ObservationUpdate } from "../src/types.ts";
@@ -42,10 +45,28 @@ function makeAgentState(root: LangfuseObservation): AgentState {
   };
 }
 
-function makeRuntime(): LangfuseRuntime {
+interface FakeRuntime extends LangfuseRuntime {
+  created: FakeObservation[];
+  propagated: Array<Record<string, unknown>>;
+}
+
+let installedRuntime: FakeRuntime;
+
+function makeRuntime(): FakeRuntime {
+  const created: FakeObservation[] = [];
+  const propagated: Array<Record<string, unknown>> = [];
   return {
-    startObservation: (name, body) => new FakeObservation({ ...body, metadata: { ...body?.metadata, name } }),
-    propagateAttributes: (_attributes, fn) => fn(),
+    created,
+    propagated,
+    startObservation: (name, body) => {
+      const observation = new FakeObservation({ ...body, metadata: { ...body?.metadata, name } });
+      created.push(observation);
+      return observation;
+    },
+    propagateAttributes: (attributes, fn) => {
+      propagated.push(attributes as unknown as Record<string, unknown>);
+      return fn();
+    },
     withRootContext: (fn) => fn(),
     scoreClient: {},
   };
@@ -61,7 +82,8 @@ function installTestState(sessionId: string): Config | null {
     host: "https://example.com",
     capturePolicy: createCapturePolicy({ LANGFUSE_PRIVACY_PRESET: "full-debug" }),
   };
-  __setRuntimeForTest(makeRuntime());
+  installedRuntime = makeRuntime();
+  __setRuntimeForTest(installedRuntime);
   return previousConfig;
 }
 
@@ -70,6 +92,83 @@ function restoreTestState(previousConfig: Config | null): void {
   clearAllSessionStates();
   state.config = previousConfig;
 }
+
+test("failed compactions are visible and redact status text even with output capture disabled", async () => {
+  const previousConfig = installTestState("compaction-failure-test");
+  try {
+    state.config!.capturePolicy = createCapturePolicy({ LANGFUSE_PRIVACY_PRESET: "metadata-only" });
+    const root = new FakeObservation();
+    state.agentState = makeAgentState(root);
+    await recordSessionCompactionFailure({
+      reason: "threshold", aborted: false, willRetry: false, fromExtension: false,
+      errorMessage: '{"error":"prefill failed","Authorization":"Bearer secret-value","apiKey":"synthetic-private-value","password":"synthetic-password"}',
+    });
+    const event = root.children[0];
+    assert.equal(event?.name, "session-compaction-failed");
+    assert.equal(event?.type, "event");
+    assert.equal(event?.observation.body?.level, "ERROR");
+    assert.equal(typeof event?.observation.body?.statusMessage, "string");
+    assert.match(event!.observation.body!.statusMessage!, /prefill failed/);
+    assert.doesNotMatch(event!.observation.body!.statusMessage!, /secret-value|synthetic-private-value|synthetic-password/);
+    assert.equal(event?.observation.body?.metadata?.reason, "threshold");
+    assert.equal(event?.observation.ended, true);
+
+    await recordSessionCompactionFailure({ reason: "manual", aborted: true, willRetry: false });
+    assert.equal(root.children[1]?.observation.body?.level, "WARNING");
+    assert.equal(root.children[1]?.observation.body?.statusMessage, "Compaction cancelled");
+
+    state.isTracingDisabled = true;
+    await recordSessionCompactionFailure({ aborted: false });
+    assert.equal(root.children.length, 2);
+  } finally {
+    restoreTestState(previousConfig);
+  }
+});
+
+test("native compaction prefixes do not expose JSON credentials", async () => {
+  const previousConfig = installTestState("prefixed-compaction-failure");
+  try {
+    state.config!.capturePolicy = createCapturePolicy({ LANGFUSE_PRIVACY_PRESET: "metadata-only" });
+    const root = new FakeObservation();
+    state.agentState = makeAgentState(root);
+    await recordSessionCompactionFailure({
+      reason: "manual", aborted: false,
+      errorMessage: 'Compaction failed: 429 {"error":"quota exceeded","apiKey":"synthetic-private-value","password":"synthetic-password"}',
+    });
+    const status = root.children[0].observation.body?.statusMessage;
+    assert.match(status!, /Compaction failed: 429/);
+    assert.match(status!, /quota exceeded/);
+    assert.doesNotMatch(status!, /synthetic-private-value|synthetic-password/);
+  } finally {
+    restoreTestState(previousConfig);
+  }
+});
+
+test("standalone traces mask sensitive custom parent IDs", async () => {
+  const previousConfig = installTestState("custom-parent-id");
+  const dir = mkdtempSync(join(tmpdir(), "pi-langfuse-custom-parent-"));
+  try {
+    state.config!.capturePolicy = createCapturePolicy({ LANGFUSE_PRIVACY_PRESET: "metadata-only" });
+    const parentSession = join(dir, "session.jsonl");
+    writeFileSync(parentSession, JSON.stringify({ type: "session", id: "sk-lf-synthetic-review-value" }) + "\n");
+    const ctx = { sessionManager: {
+      getHeader: () => ({ parentSession }),
+      getEntries: () => [{ type: "usage", id: "custom-parent-cache", kind: "cache_warm", usage: { input: 2 } }],
+    } };
+    await recordCacheWarmingDecision({ action: "warm" }, ctx);
+    await recordNewUsageEntries(ctx);
+    await recordSessionCompactionFailure({ errorMessage: "Synthetic failure" });
+    assert.equal(installedRuntime.propagated.length, 3);
+    for (const attributes of installedRuntime.propagated) {
+      const metadata = attributes.metadata as Record<string, string>;
+      assert.equal(metadata.parentSessionId, "[REDACTED_SECRET]");
+      assert.equal(metadata.sessionKind, "fork");
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    restoreTestState(previousConfig);
+  }
+});
 
 test("cache warming decision is an event under the active agent trace", async () => {
   const previousConfig = installTestState("cache-decision-test");
@@ -168,3 +267,86 @@ test("session compaction records checkpoint state and summary generation usage",
     restoreTestState(previousConfig);
   }
 });
+
+test("compaction summary JSON credentials are masked in input and output", async () => {
+  const previousConfig = installTestState("compaction-secret-test");
+  try {
+    await recordSessionCompaction({ compactionEntry: {
+      summary: '{"password":"synthetic-review-canary"}',
+      usage: { input: 5, output: 3 },
+    } });
+    const compaction = installedRuntime.created[0];
+    assert.doesNotMatch(JSON.stringify(compaction.body?.input), /synthetic-review-canary/);
+    assert.equal(compaction.children[0].observation.body?.output, "[REDACTED_SECRET]");
+  } finally {
+    restoreTestState(previousConfig);
+  }
+});
+
+test("compaction events survive a settled run and are stamped with the session", async () => {
+  const previousConfig = installTestState("compaction-out-of-run-test");
+  try {
+    state.agentState = null;
+
+    await recordSessionCompactionFailure({ reason: "threshold", aborted: false, willRetry: false, errorMessage: "prefill failed" });
+    await recordSessionCompaction({
+      reason: "manual",
+      compactionEntry: {
+        id: "compact-2",
+        tokensBefore: 90_000,
+        summary: "Earlier work summary",
+        usage: { input: 10, output: 5, totalTokens: 15 },
+      },
+    });
+
+    assert.equal(installedRuntime.propagated.length, 2);
+    assert.equal(installedRuntime.propagated[0]?.sessionId, "compaction-out-of-run-test");
+    assert.equal(installedRuntime.propagated[0]?.traceName, "pi-session");
+
+    const failure = installedRuntime.created[0];
+    assert.equal(failure?.ended, true);
+    assert.equal(failure?.body?.level, "ERROR");
+    assert.match(String(failure?.body?.statusMessage), /prefill failed/);
+
+    const compaction = installedRuntime.created[1];
+    assert.equal(compaction?.children[0]?.name, "compaction-summary");
+    assert.equal(compaction?.children[0]?.observation.ended, true);
+    assert.equal(compaction?.ended, true);
+  } finally {
+    restoreTestState(previousConfig);
+  }
+});
+
+for (const withRootContext of [true, false]) {
+  test(`idle child cache traces retain lineage and usage (root context: ${withRootContext})`, async () => {
+    const previousConfig = installTestState("idle-child");
+    const previousChildFlag = process.env.PI_SUBAGENT_CHILD;
+    process.env.PI_SUBAGENT_CHILD = "1";
+    try {
+      if (!withRootContext) installedRuntime.withRootContext = undefined;
+      const parentId = "01a1639b-58c5-729a-8315-f17b045ccd28";
+      const ctx = {
+        isIdle: () => true,
+        sessionManager: {
+          getHeader: () => ({ parentSession: `/nonexistent/${parentId}.jsonl` }),
+          getEntries: () => [{ type: "usage", id: "idle-usage", kind: "cache_warm",
+            usage: { input: 10, output: 2 }, cost: { total: 0.03 } }],
+        },
+      };
+      await recordCacheWarmingDecision({ action: "warm" }, ctx);
+      await recordNewUsageEntries(ctx);
+      await recordNewUsageEntries(ctx);
+      assert.equal(installedRuntime.created.length, 2);
+      for (const attributes of installedRuntime.propagated) {
+        assert.equal(attributes.sessionId, "idle-child");
+        assert.deepEqual(attributes.metadata, { parentSessionId: parentId, sessionKind: "subagent" });
+      }
+      assert.equal(installedRuntime.created[1].body?.usageDetails?.input, 10);
+      assert.equal(installedRuntime.created[1].body?.costDetails?.total, 0.03);
+    } finally {
+      if (previousChildFlag === undefined) delete process.env.PI_SUBAGENT_CHILD;
+      else process.env.PI_SUBAGENT_CHILD = previousChildFlag;
+      restoreTestState(previousConfig);
+    }
+  });
+}

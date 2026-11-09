@@ -117,6 +117,27 @@ test("registers OTel context propagation for Langfuse trace attributes", async (
   }
 });
 
+test("concurrent first callers share one runtime and one SDK shutdown", async () => {
+  const previousConfig = state.config;
+  state.config = { publicKey: "pk_test", secretKey: "sk_test", host: "https://example.invalid" };
+  __setRuntimeForTest(null);
+  const runtimes = await Promise.all([getRuntime(), getRuntime()]);
+  try {
+    assert.equal(runtimes[0], runtimes[1]);
+    let shutdowns = 0;
+    const provider = runtimes[0].tracerProvider!;
+    const shutdown = provider.shutdown!.bind(provider);
+    provider.shutdown = async () => { shutdowns++; await shutdown(); };
+    await forceShutdownRuntime();
+    assert.equal(shutdowns, 1);
+  } finally {
+    await forceShutdownRuntime();
+    for (const rt of new Set(runtimes)) await rt.tracerProvider?.shutdown?.();
+    __setRuntimeForTest(null);
+    state.config = previousConfig;
+  }
+});
+
 test("force shutdown does not hang when Langfuse SDK shutdown stalls", async () => {
   const runtime = {
     startObservation: (() => {
@@ -206,11 +227,11 @@ test("shutdown treats a fallback deadline abort as expected control flow", async
       host: "https://example.com",
     },
     restFallback: {
-      trace: {
+      traces: new Map([["slow-trace", {
         id: "slow-trace",
         timestamp: new Date().toISOString(),
         name: "pi-agent",
-      },
+      }]]),
       observations: [],
       observationById: new Map(),
       attempted: false,
@@ -255,11 +276,11 @@ test("shutdown completes primary cleanup before best-effort REST fallback", asyn
       host: "https://example.com",
     },
     restFallback: {
-      trace: {
+      traces: new Map([["ordered-trace", {
         id: "ordered-trace",
         timestamp: new Date().toISOString(),
         name: "pi-agent",
-      },
+      }]]),
       observations: [],
       observationById: new Map(),
       attempted: false,
@@ -894,11 +915,11 @@ test("REST fallback skips legacy ingestion when the legacy trace API is unavaila
       host: "https://example.com",
     },
     restFallback: {
-      trace: {
+      traces: new Map([["v4-trace", {
         id: "v4-trace",
         timestamp: new Date().toISOString(),
         name: "pi-agent",
-      },
+      }]]),
       observations: [],
       observationById: new Map(),
       attempted: false,
@@ -934,11 +955,11 @@ test("REST fallback fails closed when legacy API capability is ambiguous", async
       host: "https://example.com",
     },
     restFallback: {
-      trace: {
+      traces: new Map([["ambiguous-trace", {
         id: "ambiguous-trace",
         timestamp: new Date().toISOString(),
         name: "pi-agent",
-      },
+      }]]),
       observations: [],
       observationById: new Map(),
       attempted: false,
@@ -975,11 +996,11 @@ test("REST fallback stops after a trace is visible", async () => {
       host: "https://example.com",
     },
     restFallback: {
-      trace: {
+      traces: new Map([["visible-trace", {
         id: "visible-trace",
         timestamp: new Date().toISOString(),
         name: "pi-agent",
-      },
+      }]]),
       observations: [],
       observationById: new Map(),
       attempted: false,
@@ -1005,6 +1026,39 @@ test("REST fallback stops after a trace is visible", async () => {
   }
 });
 
+test("REST fallback leaves time to ingest multiple traces when read responses are slow", async () => {
+  const originalFetch = globalThis.fetch;
+  const restored: string[] = [];
+  const traces = Array.from({ length: 12 }, (_, index) => ({
+    id: `slow-trace-${index}`, timestamp: new Date().toISOString(), name: "pi-session",
+  }));
+  const runtime = createTestRuntime({
+    runtimeConfig: { publicKey: "pk_test", secretKey: "sk_test", host: "https://example.invalid" },
+    restFallback: { traces: new Map(traces.map(trace => [trace.id, trace])), observations: [], observationById: new Map(), attempted: false },
+  });
+  globalThis.fetch = async (input, init) => {
+    await new Promise<void>((resolve, reject) => {
+      init?.signal?.throwIfAborted();
+      const aborted = () => { clearTimeout(timer); reject(new DOMException("Aborted", "AbortError")); };
+      const timer = setTimeout(() => { init?.signal?.removeEventListener("abort", aborted); resolve(); }, 180);
+      init?.signal?.addEventListener("abort", aborted, { once: true });
+    });
+    if (init?.method === "POST") {
+      restored.push(...JSON.parse(String(init.body)).batch.filter((entry: any) => entry.type === "trace-create").map((entry: any) => entry.body.id));
+      return new Response('{"errors":[]}', { status: 200 });
+    }
+    return new Response("{}", { status: String(input).endsWith("?limit=1") ? 200 : 404 });
+  };
+  try {
+    __setRuntimeForTest(runtime);
+    await forceShutdownRuntime();
+    assert.deepEqual(restored.sort(), traces.map(trace => trace.id).sort());
+  } finally {
+    __setRuntimeForTest(null);
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("REST fallback checks legacy API capability and ingests a missing trace", async () => {
   const requests: Array<{ method: string; url: string; body?: string }> = [];
   const runtime = {
@@ -1021,12 +1075,12 @@ test("REST fallback checks legacy API capability and ingests a missing trace", a
       host: "https://example.com",
     },
     restFallback: {
-      trace: {
+      traces: new Map([["fallback-trace", {
         id: "fallback-trace",
         timestamp: new Date().toISOString(),
         name: "pi-agent",
         userId: "user-123",
-      },
+      }]]),
       observations: [],
       observationById: new Map(),
       attempted: false,
@@ -1089,11 +1143,11 @@ test("REST fallback splits oversized ingestion payloads into byte-bounded batche
       host: "https://example.com",
     },
     restFallback: {
-      trace: {
+      traces: new Map([["oversized-trace", {
         id: "oversized-trace",
         timestamp: new Date().toISOString(),
         name: "pi-agent",
-      },
+      }]]),
       observations: Array.from({ length: 8 }, (_, index) => ({
         id: `obs-${index}`,
         traceId: "oversized-trace",
@@ -1175,11 +1229,11 @@ test("REST fallback warns and skips ingestion when the total payload exceeds the
       host: "https://example.com",
     },
     restFallback: {
-      trace: {
+      traces: new Map([["oversized-trace", {
         id: "oversized-trace",
         timestamp: new Date().toISOString(),
         name: "pi-agent",
-      },
+      }]]),
       observations: Array.from({ length: 3 }, (_, index) => ({
         id: `obs-${index}`,
         traceId: "oversized-trace",

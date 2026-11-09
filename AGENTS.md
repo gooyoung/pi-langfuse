@@ -20,12 +20,15 @@ feature documentation, prefer `README.md` and `README_CN.md`.
 - `src/handlers/tool.ts`: tracks tool observations, correlates them by `toolCallId`, and records tool error scores.
 - `src/handlers/turn.ts`: creates turn-level span wrappers so generations and tools can nest under a turn.
 - `src/state.ts`: session-scoped mutable runtime state built on `AsyncLocalStorage`.
+- `src/session-lineage.ts`: resolves the parent session id from Pi's session header and caches lineage per session.
 - `src/config.ts`: config loading, first-run setup UI, and config persistence.
 - `src/langfuse.ts`: Langfuse runtime bootstrap, score client, flush/shutdown, and REST fallback ingestion.
 - `src/utils.ts`: payload shaping, truncation, extraction helpers, and defensive parsing.
 - `src/constants.ts`: payload size and truncation limits.
 - `src/types.ts`: shared runtime and observation typings.
 - `test/state.test.ts`: verifies per-session state isolation and overlapping async session safety.
+- `test/session-lineage.test.ts`: verifies parent id resolution, the `subagent`/`fork` label, caching, and
+  that lineage does not leak across sessions.
 - `test/utils.test.ts`: verifies payload shaping limits and circular handling.
 - `.agents/skills/langfuse/`: local Langfuse skill docs and references used by agents working in this repo.
 
@@ -40,6 +43,9 @@ The extension maps Pi events onto one Langfuse trace tree:
 - Tool calls become `tool` observations.
 - Turns become `span` observations that can parent generations and tool calls.
 - Session-level bookkeeping is keyed by Pi session ID, not by global process state.
+- A derived session (fork or `pi-subagents` child) stamps `parentSessionId` and `sessionKind` on trace
+  metadata from `sessionManager.getHeader().parentSession`. Sessions are never re-routed: the link between
+  a parent and its children is metadata only, because Langfuse has no session-to-session relation.
 
 The main event flow is:
 
@@ -114,7 +120,8 @@ Relevant implementation details:
   default 4MB) so a single request stays below the Langfuse gateway ~4.5MB body limit, and it is skipped
   with a warning when the whole payload exceeds `DEFAULT_MAX_FALLBACK_TOTAL_BYTES` (default 32MB).
   Both knobs are env-tunable (`PI_LANGFUSE_MAX_INGESTION_BATCH_BYTES`, `PI_LANGFUSE_MAX_FALLBACK_TOTAL_BYTES`).
-- `splitIngestionBatch()` preserves entries exactly across chunks; keep the trace-create entry first.
+- `splitIngestionBatch()` preserves retained entries exactly across chunks and skips individually oversized
+  events with a size-only warning; keep the trace-create entry first when it fits.
 - Scores are sent separately through the Langfuse client; they are not part of the OTel span export path.
 - Root trace IO is mirrored from the root agent observation when `setTraceIO()` is available.
 

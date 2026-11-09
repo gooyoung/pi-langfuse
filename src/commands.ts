@@ -35,6 +35,7 @@ interface CommandDeps {
 interface ConnectivityResult {
   ok: boolean;
   message: string;
+  warning?: boolean;
 }
 
 function notify(ctx: CommandContextLike, message: string, level: "info" | "warning" | "error" = "info") {
@@ -226,6 +227,35 @@ function formatStatus(configPath: string, env: Record<string, string | undefined
   ].join("\n");
 }
 
+// v4 events_only removes legacy reads; older servers may not expose v2 reads.
+const READ_PROBE_WINDOW_MS = 6 * 60 * 60 * 1_000;
+
+async function probeReadSurface(host: string, auth: string): Promise<{ message: string; warning: boolean }> {
+  const to = new Date();
+  const from = new Date(to.getTime() - READ_PROBE_WINDOW_MS);
+  const url = `${host}/api/public/v2/observations?fromStartTime=${from.toISOString()}&toStartTime=${to.toISOString()}&limit=1`;
+
+  for (const [name, endpoint] of [
+    ["v2 observations", url],
+    ["legacy observations", `${host}/api/public/observations?limit=1`],
+  ]) {
+    try {
+      const response = await fetch(endpoint, {
+        headers: { Authorization: `Basic ${auth}` },
+        signal: AbortSignal.timeout(10_000),
+      });
+      if (name === "v2 observations" && (response.status === 404 || response.status === 405)) continue;
+      return {
+        message: `read: ${name} ${response.ok ? "ok" : `HTTP ${response.status}`}`,
+        warning: !response.ok,
+      };
+    } catch (error) {
+      return { message: `read: ${name} failed: ${error instanceof Error ? error.message : String(error)}`, warning: true };
+    }
+  }
+  return { message: "read: unavailable", warning: true };
+}
+
 async function checkLangfuseConnectivity(config: Config): Promise<ConnectivityResult> {
   const host = config.host.replace(/\/+$/, "");
   const auth = Buffer.from(`${config.publicKey}:${config.secretKey}`).toString("base64");
@@ -239,7 +269,8 @@ async function checkLangfuseConnectivity(config: Config): Promise<ConnectivityRe
     });
 
     if (response.ok) {
-      return { ok: true, message: `Connected to ${config.host}` };
+      const read = await probeReadSurface(host, auth);
+      return { ok: true, message: `Connected to ${config.host}; ${read.message}`, warning: read.warning };
     }
 
     return {
@@ -413,7 +444,8 @@ export async function handleLangfuseTestCommand(
         return observation;
       },
     );
-    notify(ctx, `Langfuse test succeeded. ${connectivity.message}; test trace sent to ${config.host}.`);
+    const result = connectivity.warning ? "completed with a read warning" : "succeeded";
+    notify(ctx, `Langfuse test ${result}. ${connectivity.message}; test trace sent to ${config.host}.`, connectivity.warning ? "warning" : "info");
     return true;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);

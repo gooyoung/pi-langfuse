@@ -1,10 +1,11 @@
 import { state, resetRunState, computeEvaluationScores } from "../state.js";
 import { getRuntime, sendScore } from "../langfuse.js";
 import { ensureConfig } from "../config.js";
-import { shapePayload, truncate, extractFinalAssistant, extractAssistantOutput, getCapturePolicy, getLimits } from "../utils.js";
+import { shapePayload, truncate, extractFinalAssistant, extractAssistantOutput, getCapturePolicy } from "../utils.js";
 import { closeDanglingObservations } from "./tool.js";
 import { applyCapturePolicy } from "../capture-policy.js";
 import { collectSourceMetadata } from "../source-metadata.js";
+import { sessionLineageMetadata } from "../session-lineage.js";
 import { startChildObservation } from "../observation.js";
 
 function stringMetadata(metadata: Record<string, unknown> | undefined): Record<string, string> | undefined {
@@ -72,6 +73,7 @@ export async function startAgentRun(event: Record<string, unknown>, ctx: any) {
           ...(state.currentProvider ? { provider: state.currentProvider } : {}),
           sessionId: state.currentSessionId || undefined,
           sessionLeafId: ctx?.sessionManager?.getLeafId?.() || undefined,
+          ...sessionLineageMetadata(ctx?.sessionManager),
         },
       },
       capturePolicy,
@@ -225,7 +227,7 @@ export async function recordSystemPrompt(ctx: any) {
   }
 
   const captured = applyCapturePolicy(
-    { systemPrompt: truncate(String(systemPrompt), getLimits().maxString) },
+    { systemPrompt: String(systemPrompt) },
     getCapturePolicy(),
   );
   if (!captured.systemPrompt) {
